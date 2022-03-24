@@ -26,7 +26,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -106,9 +108,11 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 					if pod, ok := t.Obj.(*v1.Pod); ok {
 						return isAssigned(pod)
 					}
+					klog.Errorf("unable to convert object %T to *v1.Pod in %T", obj, pl)
 					utilruntime.HandleError(fmt.Errorf("unable to convert object %T to *v1.Pod in %T", obj, pl))
 					return false
 				default:
+					klog.Errorf("unable to handle object in %T: %T", pl, obj)
 					utilruntime.HandleError(fmt.Errorf("unable to handle object in %T: %T", pl, obj))
 					return false
 				}
@@ -197,14 +201,15 @@ func (pl *TargetLoadPacking) Score(ctx context.Context, cycleState *framework.Cy
 		// TODO(aqadeer): If this happens for a long time, fall back to allocation based packing. This could mean maintaining failure state across cycles if scheduler doesn't provide this state
 	}
 
-	var curPodCPUUsage int64
+	var incomingPodCPUMillis int64
+	incomingPodName := pod.ObjectMeta.Namespace + "/" + pod.Name
 	for _, container := range pod.Spec.Containers {
-		curPodCPUUsage += PredictUtilisation(&container)
+		incomingPodCPUMillis += PredictCPUUtilisation(incomingPodName, &container)
 	}
-	klog.V(6).InfoS("Predicted utilization for pod", "podName", pod.Name, "cpuUsage", curPodCPUUsage)
 	if pod.Spec.Overhead != nil {
-		curPodCPUUsage += pod.Spec.Overhead.Cpu().MilliValue()
+		incomingPodCPUMillis += pod.Spec.Overhead.Cpu().MilliValue()
 	}
+	klog.V(6).InfoS("Predicted cpu usage for incoming pod", "podName", incomingPodName, "millis", incomingPodCPUMillis)
 
 	var nodeCPUUtilPercent float64
 	var cpuMetricFound bool
@@ -224,42 +229,39 @@ func (pl *TargetLoadPacking) Score(ctx context.Context, cycleState *framework.Cy
 	nodeCPUCapMillis := float64(nodeInfo.Node().Status.Capacity.Cpu().MilliValue())
 	nodeCPUUtilMillis := (nodeCPUUtilPercent / 100) * nodeCPUCapMillis
 
-	klog.V(6).InfoS("Calculating CPU utilization and capacity", "nodeName", nodeName, "cpuUtilMillis", nodeCPUUtilMillis, "cpuCapMillis", nodeCPUCapMillis)
+	klog.V(6).InfoS("Calculated CPU utilization and capacity", "nodeName", nodeName, "cpuUtilPercent", nodeCPUUtilPercent, "cpuUtilMillis", nodeCPUUtilMillis, "cpuCapMillis", nodeCPUCapMillis)
 
-	var missingCPUUtilMillis int64 = 0
+	// The number of CPU millis claimed by pod.spec.containers[].resources limits or requests (starting with a base of the incoming pod's need.
+	var scheduledResourcesCPUMillis int64 = 0
 	pl.eventHandler.RLock()
+	podCount := len(pl.eventHandler.ScheduledPodsCache[nodeName])
 	for _, info := range pl.eventHandler.ScheduledPodsCache[nodeName] {
-		// If the time stamp of the scheduled pod is outside fetched metrics window, or it is within metrics reporting interval seconds, we predict util.
-		// Note that the second condition doesn't guarantee metrics for that pod are not reported yet as the 0 <= t <= 2*metricsAgentReportingIntervalSeconds
-		// t = metricsAgentReportingIntervalSeconds is taken as average case and it doesn't hurt us much if we are
-		// counting metrics twice in case actual t is less than metricsAgentReportingIntervalSeconds
-		if info.Timestamp.Unix() > metrics.Window.End || info.Timestamp.Unix() <= metrics.Window.End &&
-			(metrics.Window.End-info.Timestamp.Unix()) < metricsAgentReportingIntervalSeconds {
-			for _, container := range info.Pod.Spec.Containers {
-				missingCPUUtilMillis += PredictUtilisation(&container)
-			}
-			missingCPUUtilMillis += info.Pod.Spec.Overhead.Cpu().MilliValue()
-			klog.V(6).InfoS("Missing utilization for pod", "podName", info.Pod.Name, "missingCPUUtilMillis", missingCPUUtilMillis)
+		podName := nodeName + "/" + info.Pod.ObjectMeta.Namespace + "/" + info.Pod.Name
+		for _, container := range info.Pod.Spec.Containers {
+			scheduledResourcesCPUMillis += PredictCPUUtilisation(podName, &container)
 		}
+		scheduledResourcesCPUMillis += info.Pod.Spec.Overhead.Cpu().MilliValue()
 	}
 	pl.eventHandler.RUnlock()
-	klog.V(6).InfoS("Missing utilization for node", "nodeName", nodeName, "missingCPUUtilMillis", missingCPUUtilMillis)
 
-	var predictedCPUUsage float64
-	if nodeCPUCapMillis != 0 {
-		predictedCPUUsage = 100 * (nodeCPUUtilMillis + float64(curPodCPUUsage) + float64(missingCPUUtilMillis)) / nodeCPUCapMillis
-	}
-	if predictedCPUUsage > float64(hostTargetUtilizationPercent) {
-		if predictedCPUUsage > 100 {
-			return framework.MinNodeScore, framework.NewStatus(framework.Success, "")
+	klog.V(6).InfoS("Existing resource claims for node", "nodeName", nodeName, "scheduledResourcesCPUMillis", scheduledResourcesCPUMillis, "podCount", podCount)
+
+	score := framework.MinNodeScore
+	if nodeCPUCapMillis != 0 && scheduledResourcesCPUMillis != 0 {
+		predictedCPUUsage := 100 * (nodeCPUUtilMillis + float64(incomingPodCPUMillis)) / nodeCPUCapMillis
+		scheduledResourceReservations := 100 * float64(scheduledResourcesCPUMillis + incomingPodCPUMillis) / nodeCPUCapMillis
+		if podCount > 130 {
+			klog.V(6).InfoS("Node will NOT be prioritized because pod count is high", "nodeName", nodeName, "podCount", podCount)
+		} else if scheduledResourceReservations > 80 {
+			klog.V(6).InfoS("Node will NOT be prioritized because scheduled resources are high", "nodeName", nodeName, "scheduledResourceReservations", scheduledResourceReservations)
+		} else if predictedCPUUsage > float64(hostTargetUtilizationPercent) {
+			klog.V(6).InfoS("Node will NOT be prioritized because predicted CPU utilization is high", "nodeName", nodeName, "predictedCPUUsage", predictedCPUUsage)
+		} else {
+			klog.V(6).InfoS("Node WILL be prioritized because scheduled resources and measured CPU utilization are within targets", "nodeName", nodeName, "scheduledResourceReservations", scheduledResourceReservations, "predictedCPUUsage", predictedCPUUsage, )
+			score = framework.MaxNodeScore
 		}
-		penalisedScore := int64(math.Round(50 * (100 - predictedCPUUsage) / (100 - float64(hostTargetUtilizationPercent))))
-		klog.V(6).InfoS("Penalised score for host", "nodeName", nodeName, "penalisedScore", penalisedScore)
-		return penalisedScore, framework.NewStatus(framework.Success, "")
 	}
 
-	score := int64(math.Round((100-float64(hostTargetUtilizationPercent))*
-		predictedCPUUsage/float64(hostTargetUtilizationPercent) + float64(hostTargetUtilizationPercent)))
 	klog.V(6).InfoS("Score for host", "nodeName", nodeName, "score", score)
 	return score, framework.NewStatus(framework.Success, "")
 }
@@ -268,7 +270,74 @@ func (pl *TargetLoadPacking) ScoreExtensions() framework.ScoreExtensions {
 	return pl
 }
 
-func (pl *TargetLoadPacking) NormalizeScore(context.Context, *framework.CycleState, *v1.Pod, framework.NodeScoreList) *framework.Status {
+func (pl *TargetLoadPacking) NormalizeScore(ctx context.Context, state *framework.CycleState, pod *v1.Pod, scores framework.NodeScoreList) *framework.Status {
+
+	scoresCopy := make(framework.NodeScoreList, len(scores))
+	copy(scoresCopy, scores)
+	sort.Slice(scoresCopy, func(i, j int) bool {
+		return strings.Compare(scoresCopy[i].Name, scoresCopy[j].Name) < 0
+	})
+
+	klog.V(6).InfoS("Incoming nodes in order of preferred name", "scoresCopy", scoresCopy)
+
+	scoresMap := make(map[string]*framework.NodeScore)
+	for i := range scores {
+		scoresMap[scores[i].Name] = &scores[i]
+	}
+
+	targetNodeFound := false
+	for _, nodeScore := range scoresCopy {
+		if targetNodeFound {
+			klog.V(6).InfoS("Already found target node; setting this node's score to 0", "name", nodeScore.Name)
+			scoresMap[nodeScore.Name].Score = framework.MinNodeScore
+		} else {
+			if nodeScore.Score == framework.MaxNodeScore {
+				klog.V(6).InfoS("Found first underutilized node; other nodes scores will be eliminated", "targetNode", nodeScore.Name, "score", nodeScore.Score)
+				targetNodeFound = true
+			} else {
+				klog.V(6).InfoS("Found overutilized node while searching for target", "name", nodeScore.Name, "score", nodeScore.Score)
+			}
+		}
+	}
+
+	/*
+	// Find highest and lowest scores.
+	boostIndex := 0
+	boostName := scores[0].Name
+	for i, nodeScore := range scores {
+		klog.V(6).InfoS("Analyzing node", "name", nodeScore.Name, "score", nodeScore.Score)
+		if strings.Compare(boostName, nodeScore.Name) > 0 {
+			boostIndex = i
+			boostName = nodeScore.Name
+		}
+	}
+
+	if scores[boostIndex].Score == framework.MaxNodeScore {
+		klog.V(6).InfoS("Boost node has capacity; minimizing other nodes", "boostName", boostName)
+		for i, _ := range scores {
+			if i != boostIndex {
+				scores[i].Score = framework.MinNodeScore
+			}
+		}
+	} else {
+		klog.V(6).InfoS("Boost node is on target; letting other scores stand", "boostName", boostName, "count", len(scores))
+	}
+	*/
+
+	for _, nodeScore := range scores {
+		klog.V(6).InfoS("Scored node", "name", nodeScore.Name, "score", nodeScore.Score)
+	}
+
+	// REMOVE  REMOVE  REMOVE
+	// REMOVE  REMOVE  REMOVE
+	// REMOVE  REMOVE  REMOVE
+	/*
+	for i, nodeScore := range scores {
+		scores[i].Score = 0
+		klog.V(6).InfoS("DEBUG CLEARING ALL SCORES", "name", nodeScore.Name, "score", nodeScore.Score)
+	}
+	*/
+
 	return nil
 }
 
@@ -278,10 +347,12 @@ func isAssigned(pod *v1.Pod) bool {
 }
 
 // Predict utilization for a container based on its requests/limits
-func PredictUtilisation(container *v1.Container) int64 {
+func PredictCPUUtilisation(podName string, container *v1.Container) int64 {
 	if _, ok := container.Resources.Limits[v1.ResourceCPU]; ok {
+		klog.V(6).InfoS(" Predicting using cpu limits for", "podName", podName, "container", container.Name, "millis", container.Resources.Limits.Cpu().MilliValue())
 		return container.Resources.Limits.Cpu().MilliValue()
 	} else if _, ok := container.Resources.Requests[v1.ResourceCPU]; ok {
+		klog.V(6).InfoS(" Predicting using cpu requests for", "podName", podName, "container", container.Name, "millis", container.Resources.Requests.Cpu().MilliValue(), "requestsMultiplier", requestsMultiplier)
 		return int64(math.Round(float64(container.Resources.Requests.Cpu().MilliValue()) * requestsMultiplier))
 	} else {
 		return requestsMilliCores

@@ -21,7 +21,6 @@ Package Trimaran provides common code for plugins developed for real load aware 
 package trimaran
 
 import (
-	"sort"
 	"sync"
 	"time"
 
@@ -34,7 +33,7 @@ const (
 	// This is the maximum staleness of metrics possible by load watcher
 	cacheCleanupIntervalMinutes = 5
 	// Time interval in seconds for each metrics agent ingestion.
-	metricsAgentReportingIntervalSeconds = 60
+	metricsAgentReportingIntervalSeconds = 5 * 60
 )
 
 var _ clientcache.ResourceEventHandler = &PodAssignEventHandler{}
@@ -110,29 +109,16 @@ func (p *PodAssignEventHandler) updateCache(pod *v1.Pod) {
 	p.Unlock()
 }
 
-// Deletes podInfo entries that are older than metricsAgentReportingIntervalSeconds. Also deletes node entry if empty
+// The old implementation assumed regular updates about pods, but that will not occur
+// with a normal informer. Just assume cache is up-to-date and clear when node is
+// gone.
 func (p *PodAssignEventHandler) cleanupCache() {
 	p.Lock()
 	defer p.Unlock()
 	for nodeName := range p.ScheduledPodsCache {
 		cache := p.ScheduledPodsCache[nodeName]
-		curTime := time.Now()
-		idx := sort.Search(len(cache), func(i int) bool {
-			return cache[i].Timestamp.Add(metricsAgentReportingIntervalSeconds * time.Second).After(curTime)
-		})
-		if idx == len(cache) {
-			continue
-		}
-		n := copy(cache, cache[idx:])
-		for j := n; j < len(cache); j++ {
-			cache[j] = podInfo{}
-		}
-		cache = cache[:n]
-
 		if len(cache) == 0 {
 			delete(p.ScheduledPodsCache, nodeName)
-		} else {
-			p.ScheduledPodsCache[nodeName] = cache
 		}
 	}
 }
