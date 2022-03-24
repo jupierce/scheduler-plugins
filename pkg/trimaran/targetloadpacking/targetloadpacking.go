@@ -98,7 +98,7 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 		eventHandler: podAssignEventHandler,
 	}
 
-	pl.handle.SharedInformerFactory().Core().V1().Pods().Informer().AddEventHandler(
+	pl.handle.SharedInformerFactory().Core().V1().Pods().Informer().AddEventHandlerWithResyncPeriod(
 		cache.FilteringResourceEventHandler{
 			FilterFunc: func(obj interface{}) bool {
 				switch t := obj.(type) {
@@ -119,6 +119,7 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 			},
 			Handler: podAssignEventHandler,
 		},
+		time.Minute * 2,
 	)
 
 	// populate metrics before returning
@@ -201,15 +202,12 @@ func (pl *TargetLoadPacking) Score(ctx context.Context, cycleState *framework.Cy
 		// TODO(aqadeer): If this happens for a long time, fall back to allocation based packing. This could mean maintaining failure state across cycles if scheduler doesn't provide this state
 	}
 
-	var incomingPodCPUMillis int64
 	incomingPodName := pod.ObjectMeta.Namespace + "/" + pod.Name
-	for _, container := range pod.Spec.Containers {
-		incomingPodCPUMillis += PredictCPUUtilisation(incomingPodName, &container)
-	}
+	incomingPodCPUMillis := CalculatePodCPURequests(pod)
 	if pod.Spec.Overhead != nil {
 		incomingPodCPUMillis += pod.Spec.Overhead.Cpu().MilliValue()
 	}
-	klog.V(6).InfoS("Predicted cpu usage for incoming pod", "podName", incomingPodName, "millis", incomingPodCPUMillis)
+	klog.V(6).InfoS("Predicted CPU usage for incoming pod", "podName", incomingPodName, "millis", incomingPodCPUMillis)
 
 	var nodeCPUUtilPercent float64
 	var cpuMetricFound bool
@@ -223,7 +221,7 @@ func (pl *TargetLoadPacking) Score(ctx context.Context, cycleState *framework.Cy
 	}
 
 	if !cpuMetricFound {
-		klog.ErrorS(nil, "Cpu metric not found in node metrics", "nodeName", nodeName, "nodeMetrics", metrics.Data.NodeMetricsMap[nodeName].Metrics)
+		klog.ErrorS(nil, "CPU metric not found in node metrics", "nodeName", nodeName, "nodeMetrics", metrics.Data.NodeMetricsMap[nodeName].Metrics)
 		return framework.MinNodeScore, nil
 	}
 	nodeCPUCapMillis := float64(nodeInfo.Node().Status.Capacity.Cpu().MilliValue())
@@ -236,11 +234,10 @@ func (pl *TargetLoadPacking) Score(ctx context.Context, cycleState *framework.Cy
 	pl.eventHandler.RLock()
 	podCount := len(pl.eventHandler.ScheduledPodsCache[nodeName])
 	for _, info := range pl.eventHandler.ScheduledPodsCache[nodeName] {
-		podName := nodeName + "/" + info.Pod.ObjectMeta.Namespace + "/" + info.Pod.Name
-		for _, container := range info.Pod.Spec.Containers {
-			scheduledResourcesCPUMillis += PredictCPUUtilisation(podName, &container)
-		}
-		scheduledResourcesCPUMillis += info.Pod.Spec.Overhead.Cpu().MilliValue()
+		podName := info.Pod.ObjectMeta.Namespace + "/" + info.Pod.Name
+		podCPURequest := CalculatePodCPURequests(info.Pod)
+		scheduledResourcesCPUMillis += podCPURequest
+		klog.V(6).InfoS("Found CPU requests for incoming pod", nodeName, nodeName, "podName", podName, "podCPURequest", podCPURequest)
 	}
 	pl.eventHandler.RUnlock()
 
@@ -252,7 +249,7 @@ func (pl *TargetLoadPacking) Score(ctx context.Context, cycleState *framework.Cy
 		scheduledResourceReservations := 100 * float64(scheduledResourcesCPUMillis + incomingPodCPUMillis) / nodeCPUCapMillis
 		if podCount > 130 {
 			klog.V(6).InfoS("Node will NOT be prioritized because pod count is high", "nodeName", nodeName, "podCount", podCount)
-		} else if scheduledResourceReservations > 80 {
+		} else if scheduledResourceReservations > 95 {
 			klog.V(6).InfoS("Node will NOT be prioritized because scheduled resources are high", "nodeName", nodeName, "scheduledResourceReservations", scheduledResourceReservations)
 		} else if predictedCPUUsage > float64(hostTargetUtilizationPercent) {
 			klog.V(6).InfoS("Node will NOT be prioritized because predicted CPU utilization is high", "nodeName", nodeName, "predictedCPUUsage", predictedCPUUsage)
@@ -346,13 +343,33 @@ func isAssigned(pod *v1.Pod) bool {
 	return len(pod.Spec.NodeName) != 0
 }
 
+func CalculatePodCPURequests(pod *v1.Pod) int64 {
+	var incomingPodCPUMillis int64
+	incomingPodName := pod.ObjectMeta.Namespace + "/" + pod.Name
+	for _, container := range pod.Spec.Containers {
+		incomingPodCPUMillis += CalculateContainerCPURequests(&container)
+	}
+
+	// In cases where init containers claim limits that exceed pod resources, the init resources/limits take over as the
+	// effective requested resources for the pod: https://kubernetes.io/docs/concepts/workloads/pods/init-containers/#resources
+	var incomingPodInitCPUMillis int64
+	for _, container := range pod.Spec.InitContainers {
+		incomingPodInitCPUMillis += CalculateContainerCPURequests(&container)
+	}
+
+	finalRequestMillis := incomingPodCPUMillis
+	if incomingPodInitCPUMillis > incomingPodCPUMillis {
+		finalRequestMillis = incomingPodInitCPUMillis
+	}
+	klog.V(6).InfoS("Incoming pod resource requests calculated", "podName", incomingPodName, "mainRequests", incomingPodCPUMillis, "initRequests", incomingPodInitCPUMillis, "finalRequestMillis", finalRequestMillis )
+	return finalRequestMillis
+}
+
 // Predict utilization for a container based on its requests/limits
-func PredictCPUUtilisation(podName string, container *v1.Container) int64 {
+func CalculateContainerCPURequests(container *v1.Container) int64 {
 	if _, ok := container.Resources.Limits[v1.ResourceCPU]; ok {
-		klog.V(6).InfoS(" Predicting using cpu limits for", "podName", podName, "container", container.Name, "millis", container.Resources.Limits.Cpu().MilliValue())
 		return container.Resources.Limits.Cpu().MilliValue()
 	} else if _, ok := container.Resources.Requests[v1.ResourceCPU]; ok {
-		klog.V(6).InfoS(" Predicting using cpu requests for", "podName", podName, "container", container.Name, "millis", container.Resources.Requests.Cpu().MilliValue(), "requestsMultiplier", requestsMultiplier)
 		return int64(math.Round(float64(container.Resources.Requests.Cpu().MilliValue()) * requestsMultiplier))
 	} else {
 		return requestsMilliCores
