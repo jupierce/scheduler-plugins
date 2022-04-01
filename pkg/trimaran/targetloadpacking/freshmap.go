@@ -1,58 +1,98 @@
 package targetloadpacking
 
 import (
-	"fmt"
 	"sync"
 	"time"
 )
 
-type MetricsSample struct {
-	CpuUtil    int
-	MemoryUtil int
-	lastPut    int64
-}
-type TTLMap struct {
-	m map[string]*MetricsSample
-	maxTTL int
-	l sync.Mutex
+type item struct {
+	v interface{}
+	creationTs int64
 }
 
-func FreshMap(ln int, maxTTL int) (m *TTLMap) {
-	m = &TTLMap{m: make(map[string]*MetricsSample, ln), maxTTL: maxTTL}
+type FreshMap struct {
+	items  map[string]*item
+	maxTTL int64
+	l sync.Mutex
+	getOrLocks map[string]*sync.Mutex
+}
+
+func NewFreshMap(ln int, maxTTL int64) (m *FreshMap) {
+	m = &FreshMap{
+		items:      make(map[string]*item, ln),
+		maxTTL:     maxTTL,
+		getOrLocks: make(map[string]*sync.Mutex, ln),
+	}
 	go func() {
 		// Periodically remove expired record if no one
 		// is calling Get on them.
 		for range time.Tick(time.Minute) {
-			fmt.Println("Clearing..")
-			for k, _ := range m.m {
-				m.Get(k)
+			for k := range m.items {
+				if m.Get(k, maxTTL) == nil {
+					m.l.Lock()
+					delete(m.items, k)
+					m.l.Unlock()
+				}
 			}
 		}
 	}()
 	return
 }
 
-func (m *TTLMap) Len() int {
-	return len(m.m)
+func (m *FreshMap) Len() int {
+	return len(m.items)
 }
 
-func (m *TTLMap) Put(k string, cpuUtil int, memoryUtil int) {
+func (m *FreshMap) Put(k string, value interface{}) {
 	m.l.Lock()
 	defer m.l.Unlock()
-	it := MetricsSample{CpuUtil: cpuUtil, MemoryUtil: memoryUtil, lastPut: time.Now().Unix()}
-	m.m[k] = &it
+	it := item{v: value, creationTs: time.Now().Unix()}
+	m.items[k] = &it
 }
 
-func (m *TTLMap) Get(k string) *MetricsSample {
+func (m *FreshMap) Get(k string, noOlderThan int64) interface{} {
 	m.l.Lock()
 	defer m.l.Unlock()
-	if it, ok := m.m[k]; ok {
-		if time.Now().Unix() - it.lastPut > int64(m.maxTTL) {
-			// The sample is too old, remove old record and return nil
-			delete(m.m, k)
+	if it, ok := m.items[k]; ok {
+		if noOlderThan == 0 || time.Now().Unix() - it.creationTs > noOlderThan {
+			// The sample is too old for the caller
 			return nil
 		}
-		return it
+		return it.v
 	}
 	return nil
+}
+
+// GetOrPut helps make sure that if there are a queue of threads attempting
+// to get a value, only one will make the actual heavyweight request for
+// the latest value.
+func (m *FreshMap) GetOrPut(k string, noOlderThan int64, getValue func()(interface{}, error)) (interface{}, error) {
+	m.l.Lock()
+	keyLock, ok := m.getOrLocks[k]
+	if !ok {
+		keyLock = &sync.Mutex{}
+		m.getOrLocks[k] = keyLock
+	}
+	m.l.Unlock()
+
+	keyLock.Lock()
+	defer keyLock.Unlock()
+
+	defer func() {
+		m.l.Lock()
+		delete(m.getOrLocks, k)
+		m.l.Unlock()
+	}()
+
+	value := m.Get(k, noOlderThan)
+	if value == nil {
+		value, err := getValue()
+		if err != nil {
+			return nil, err
+		}
+		m.Put(k, value)
+		return value, nil
+	} else {
+		return value, nil
+	}
 }

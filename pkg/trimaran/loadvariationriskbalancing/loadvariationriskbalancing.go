@@ -57,7 +57,7 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 		return nil, err
 	}
 
-	podAssignEventHandler := trimaran.New()
+	podAssignEventHandler := trimaran.New(nil)
 	handle.SharedInformerFactory().Core().V1().Pods().Informer().AddEventHandler(
 		cache.FilteringResourceEventHandler{
 			FilterFunc: func(obj interface{}) bool {

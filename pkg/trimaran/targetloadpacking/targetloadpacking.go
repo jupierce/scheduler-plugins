@@ -41,8 +41,6 @@ import (
 	"time"
 
 	"github.com/paypal/load-watcher/pkg/watcher"
-	loadwatcherapi "github.com/paypal/load-watcher/pkg/watcher/api"
-
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -58,10 +56,6 @@ import (
 )
 
 const (
-	// Time interval in seconds for each metrics agent ingestion.
-	metricsAgentReportingIntervalSeconds = 60
-	metricsUpdateIntervalSeconds         = 20
-	LoadWatcherServiceClientName         = "load-watcher"
 	Name               = "TargetLoadPacking"
     SchedulerTaintName = "ci-scheduler.openshift.io/overloaded"
 )
@@ -78,13 +72,12 @@ var (
 
 type TargetLoadPacking struct {
 	handle       framework.Handle
-	client       loadwatcherapi.Client
 	metrics      watcher.WatcherMetrics
 	eventHandler     *trimaran.PodAssignEventHandler
-	// For safe access to metrics
 	mu sync.RWMutex
 	metricsClient metricsv.Interface
-	k8sClient    clientset.Interface
+	k8sClient       clientset.Interface
+	freshMetricsMap *FreshMetricsMap
 }
 
 func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) {
@@ -117,25 +110,36 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 	requestsMilliCores = args.DefaultRequests.Cpu().MilliValue()
 	requestsMultiplier, _ = strconv.ParseFloat(args.DefaultRequestsMultiplier, 64)
 
-	podAssignEventHandler := trimaran.New()
-	var client loadwatcherapi.Client
-	if args.WatcherAddress != "" {
-		client, err = loadwatcherapi.NewServiceClient(args.WatcherAddress)
-	} else {
-		opts := watcher.MetricsProviderOpts{string(args.MetricProvider.Type), args.MetricProvider.Address, args.MetricProvider.Token}
-		client, err = loadwatcherapi.NewLibraryClient(opts)
-	}
-	if err != nil {
-		return nil, err
+	pl := &TargetLoadPacking{
+		handle:          handle,
+		k8sClient:       handle.ClientSet(),
+		metricsClient:   metricsClient,
+		freshMetricsMap: NewFreshMetricsMap(0, 220, 60),
 	}
 
-	pl := &TargetLoadPacking{
-		handle:       handle,
-		client:       client,
-		eventHandler: podAssignEventHandler,
-		k8sClient:    handle.ClientSet(),
-		metricsClient: metricsClient,
-	}
+	startTime := time.Now().Unix()
+	pl.eventHandler = trimaran.New(func(pod *v1.Pod) {
+		// When a pod is assigned to a node, its impact to the CPU may not be felt for some time.
+		// To prevent a flood of pods from quickly being assigned to a seemingly underutilized nodes
+		// and those pods subsequently consuming > 100% of the CPU, we create a temporary adder
+		// to the node. This adder will increase all measured samples for the adderLifetime.
+		// This is particularly important if there is only one feasible node for a Pod. In this
+		// case, neither Score nor Normalize will be called -- on Filter.
+		// To be performant, Filter can only pull delayed metrics from the node (on average),
+		// so a quick influx of Pods can easily trick Filter into permitting the Pod
+		// to the same node again and again -- until the node metrics eventually catch up.
+		// By the time they catch up, it is too late. Adders provide a guard against this
+		// situation.
+		if pod != nil {
+			podName := pod.Namespace + "/" + pod.Name
+			// Ignore pods which were scheduled to nodes before we started
+			// scheduling.
+			if pod.GetCreationTimestamp().Unix() > startTime {
+				klog.V(6).InfoS("Pod scheduled to node; supplying metrics adder", "nodeName", pod.Spec.NodeName, "pod", podName)
+				pl.freshMetricsMap.AddAdder(pod.Spec.NodeName, 5, 5)
+			}
+		}
+	})
 
 	pl.handle.SharedInformerFactory().Core().V1().Pods().Informer().AddEventHandlerWithResyncPeriod(
 		cache.FilteringResourceEventHandler{
@@ -156,22 +160,22 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 					return false
 				}
 			},
-			Handler: podAssignEventHandler,
+			Handler: pl.eventHandler,
 		},
 		time.Minute * 2,
 	)
 
-	// populate metrics before returning
-	err = pl.updateMetrics()
-	if err != nil {
-		klog.ErrorS(err, "Unable to populate metrics initially")
-	}
 	go func() {
-		metricsUpdaterTicker := time.NewTicker(time.Second * metricsUpdateIntervalSeconds)
-		for range metricsUpdaterTicker.C {
-			err = pl.updateMetrics()
-			if err != nil {
-				klog.ErrorS(err, "Unable to update metrics")
+		ctx := context.TODO()
+		for {
+			nodeList, err := pl.k8sClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+			if err != nil  {
+				klog.Errorf("Unable to retrieve node list periodic metric refresh: %v", err)
+				continue
+			}
+			for _, node := range nodeList.Items {
+				pl.fetchHostMetrics(ctx, node.Name, 5)
+				time.Sleep(1)
 			}
 		}
 	}()
@@ -179,8 +183,8 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 	go func() {
 		ctx := context.TODO()
 		hostTargetUtilizationPercent = args.TargetUtilization
-		uncordonCheck := time.NewTicker(time.Minute * 1)
-		for range uncordonCheck.C {
+		removeTaintCheck := time.NewTicker(time.Minute * 1)
+		for range removeTaintCheck.C {
 
 			// If the scheduler is restarted, we want to find all tainted nodes and not rely
 			// on any internal state.
@@ -198,12 +202,12 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 			}
 
 			for _, nodeName := range taintedNodeNames {
-				untaintTarget := float64(hostTargetUtilizationPercent) * 0.8
-				cpuUtilPercent, memoryUtilPercent, err := pl.getWatcherUtilizations(ctx, nodeName)
+				untaintTarget := int(float64(hostTargetUtilizationPercent) * 0.8)
+				cpuUtilPercent, memoryUtilPercent, err := pl.fetchHostMetrics(ctx, nodeName, 30)
 
 				if err == nil {
 					klog.V(6).InfoS("During tainting check node utilization", "nodeName", nodeName, "cpu", cpuUtilPercent, "memory", memoryUtilPercent, "cpuTarget%", untaintTarget)
-					if cpuUtilPercent.Value < untaintTarget {
+					if cpuUtilPercent < untaintTarget {
 						pl.setNodeTaint(ctx, nodeName, false)
 					}
 				} else {
@@ -218,35 +222,20 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 }
 
 func (pl *TargetLoadPacking) Filter(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
-
-	//FIGURE OUT HOW TO GET FRESH METRICS EFFICIENTLY!
-
 	nodeName := nodeInfo.Node().Name
-	cpuUtilPercent, memoryUtilPercent, err := pl.getWatcherUtilizations(ctx, nodeName)
+	podName := pod.Namespace + "/" + pod.Name
+	cpuUtilPercent, memoryUtilPercent, err := pl.fetchHostMetrics(ctx, nodeName, 10)
 	if err != nil {
 		pl.setNodeTaint(ctx, nodeName, true)
 		klog.Errorf("Unable to check node %v metrics: %v", nodeName, err)
 		return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("Unable to check node %v metrics: %v", nodeName, err))
 	}
-	if cpuUtilPercent.Value >= float64(hostTargetUtilizationPercent) || memoryUtilPercent.Value >= 60 {
-		klog.V(6).InfoS("Filter() will NOT consider node with utilization", "nodeName", nodeName, "cpu", cpuUtilPercent.Value, "memory", memoryUtilPercent.Value)
+	if int64(cpuUtilPercent) >= hostTargetUtilizationPercent || memoryUtilPercent >= 60 {
+		klog.V(6).InfoS("Filter() will NOT consider node with utilization", "nodeName", nodeName, "namespace", "pod", podName, "cpu", cpuUtilPercent, "memory", memoryUtilPercent)
 		pl.setNodeTaint(ctx, nodeName, true)
-		return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("Node %v is heavily utilized (cpu=%v, memory=%v); tainting", nodeName, cpuUtilPercent.Value, memoryUtilPercent.Value))
+		return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("Node %v is heavily utilized (cpu=%v, memory=%v); tainting", nodeName, cpuUtilPercent, memoryUtilPercent))
 	}
-	klog.V(6).InfoS("Filter() WILL consider node with utilization", "nodeName", nodeName, "cpu", cpuUtilPercent.Value, "memory", memoryUtilPercent.Value)
-	return nil
-}
-
-func (pl *TargetLoadPacking) updateMetrics() error {
-	metrics, err := pl.client.GetLatestWatcherMetrics()
-	if err != nil {
-		return err
-	}
-
-	pl.mu.Lock()
-	pl.metrics = *metrics
-	pl.mu.Unlock()
-
+	klog.V(6).InfoS("Filter() WILL consider node with utilization", "nodeName", nodeName, "pod", podName, "cpu", cpuUtilPercent, "memory", memoryUtilPercent)
 	return nil
 }
 
@@ -289,14 +278,14 @@ func (pl *TargetLoadPacking) Score(ctx context.Context, cycleState *framework.Cy
 
 	klog.V(6).InfoS("Predicted CPU usage for incoming pod", "podName", incomingPodName, "millis", incomingPodCPUMillis)
 
-	nodeCPUUtilPercent, memoryUtilPercent, err := pl.getWatcherUtilizations(ctx, nodeName)
+	nodeCPUUtilPercent, memoryUtilPercent, err := pl.fetchHostMetrics(ctx, nodeName, 20)
 	if err != nil {
 		klog.ErrorS(nil, "CPU & memory metric not found for node", "nodeName")
 		return framework.MinNodeScore, nil
 	}
 
 	nodeCPUCapMillis := float64(nodeInfo.Node().Status.Capacity.Cpu().MilliValue())
-	nodeCPUUtilMillis := (nodeCPUUtilPercent.Value / 100) * nodeCPUCapMillis
+	nodeCPUUtilMillis := (float64(nodeCPUUtilPercent) / 100) * nodeCPUCapMillis
 
 	klog.V(6).InfoS("Calculated CPU utilization and capacity", "nodeName", nodeName, "cpuUtilPercent", nodeCPUUtilPercent, "cpuUtilMillis", nodeCPUUtilMillis, "cpuCapMillis", nodeCPUCapMillis)
 
@@ -320,7 +309,7 @@ func (pl *TargetLoadPacking) Score(ctx context.Context, cycleState *framework.Cy
 			klog.V(6).InfoS("Node will NOT be prioritized because pod count is high", "nodeName", nodeName, "podCount", podCount)
 		} else if scheduledResourceReservations > 94 {
 			klog.V(6).InfoS("Node will NOT be prioritized because combined resources claims would be too high", "nodeName", nodeName, "scheduledResourceReservations", scheduledResourceReservations)
-		} else if memoryUtilPercent.Value > 60 {
+		} else if memoryUtilPercent > 60 {
 			klog.V(6).InfoS("Node will NOT be prioritized because memory utilization is too high", "nodeName", nodeName, "memoryUtilPercent", memoryUtilPercent)
 		} else if predictedCPUUsage > float64(hostTargetUtilizationPercent) {
 			klog.V(6).InfoS("Node will NOT be prioritized because predicted CPU utilization is high", "nodeName", nodeName, "predictedCPUUsage", predictedCPUUsage)
@@ -392,80 +381,39 @@ func (pl *TargetLoadPacking) ScoreExtensions() framework.ScoreExtensions {
 	return pl
 }
 
+func (pl *TargetLoadPacking) _fetchLiveHostMetrics(ctx context.Context, nodeName string) (int, int, error) {
 
-func (pl *TargetLoadPacking) getWatcherNodeMetrics(ctx context.Context, nodeName string) (*watcher.NodeMetrics, error) {
-	// copy value lest updateMetrics() updates it and to avoid locking for rest of the function
-	pl.mu.RLock()
-	metrics := pl.metrics
-	pl.mu.RUnlock()
-
-	// This happens if metrics were never populated since scheduler started
-	if metrics.Data.NodeMetricsMap == nil {
-		return nil, fmt.Errorf("no metrics at all from watcher while checking %v", nodeName)
-	}
-	// This means the node is new (no metrics yet) or metrics are unavailable due to 404 or 500
-	if _, ok := metrics.Data.NodeMetricsMap[nodeName]; !ok {
-		return nil, fmt.Errorf("no metrics from watcher for %v", nodeName)
-	}
-
-	nodeMetrics := metrics.Data.NodeMetricsMap[nodeName]
-	return &nodeMetrics, nil
-}
-
-
-func (pl *TargetLoadPacking) getWatcherUtilizations(ctx context.Context, nodeName string) (*watcher.Metric, *watcher.Metric, error){
-
-	nodeMetrics, err := pl.getWatcherNodeMetrics(ctx, nodeName)
-	if err != nil {
-		return nil, nil, fmt.Errorf("unable to assess node %v CPU & memory utilization: %v", nodeName, err)
-	}
-
-	var cpu *watcher.Metric
-	var memory *watcher.Metric
-	for _, metric := range nodeMetrics.Metrics {
-		if metric.Type == watcher.CPU {
-			if cpu == nil && metric.Operator == watcher.Average {
-				// Permit average if latest is not found.
-				cpu = &metric
-			}
-			if metric.Operator == watcher.Latest {
-				// Prefer latest to average
-				cpu = &metric
-			}
-		} else if metric.Type == watcher.Memory {
-			if memory == nil && metric.Operator == watcher.Average {
-				// Permit average if latest is not found.
-				memory = &metric
-			}
-			if metric.Operator == watcher.Latest {
-				// Prefer latest to average
-				memory = &metric
-			}
-		}
-	}
-
-	if cpu != nil && memory != nil {
-		return cpu, memory, nil
-	}
-
-	return nil, nil, fmt.Errorf("CPU & memory metric not found in node %v metrics: %v", nodeName, nodeMetrics.Metrics)
-}
-
-func (pl *TargetLoadPacking) FetchLiveHostMetrics(ctx context.Context, host string) (float64, float64, error) {
-
-	nodeMetrics, err := pl.metricsClient.MetricsV1beta1().NodeMetricses().Get(ctx, host, metav1.GetOptions{})
+	nodeMetrics, err := pl.metricsClient.MetricsV1beta1().NodeMetricses().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
 		return 0, 0, fmt.Errorf("unable to read latest node metrics: %v", err)
 	}
-	node, err := pl.k8sClient.CoreV1().Nodes().Get(ctx, host, metav1.GetOptions{})
+	node, err := pl.k8sClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
 		return 0, 0, fmt.Errorf("unable to get node information: %v", err)
 	}
 
-	cpuUsagePercent := float64(100*nodeMetrics.Usage.Cpu().MilliValue()) / float64(node.Status.Capacity.Cpu().MilliValue())
-	memoryUsagePercent := float64(100*nodeMetrics.Usage.Memory().Value()) / float64(node.Status.Capacity.Memory().Value())
+	cpuUsagePercent := int(float64(100*nodeMetrics.Usage.Cpu().MilliValue()) / float64(node.Status.Capacity.Cpu().MilliValue()))
+	memoryUsagePercent := int(float64(100*nodeMetrics.Usage.Memory().Value()) / float64(node.Status.Capacity.Memory().Value()))
 
 	return cpuUsagePercent, memoryUsagePercent, nil
+}
+
+// fetchHostMetrics Retrieves fresh but not immediate API results from node.
+func (pl *TargetLoadPacking) fetchHostMetrics(ctx context.Context, nodeName string, noOlderThan int64) (int, int, error) {
+
+	metricsSample, err := pl.freshMetricsMap.GetOrPut(nodeName, noOlderThan,
+		func() (int, int, error) {
+			cpuUtil, memoryUtil, err := pl._fetchLiveHostMetrics(ctx, nodeName)
+			if err != nil {
+				return 0, 0, fmt.Errorf("unable to refresh latest node metrics: %v", err)
+			}
+			return cpuUtil, memoryUtil, nil
+		},
+	)
+	if err != nil {
+		return 0, 0, err
+	}
+	return metricsSample.CpuUtil, metricsSample.MemoryUtil, nil
 }
 
 func (pl *TargetLoadPacking) NormalizeScore(ctx context.Context, state *framework.CycleState, pod *v1.Pod, scores framework.NodeScoreList) *framework.Status {
@@ -490,10 +438,10 @@ func (pl *TargetLoadPacking) NormalizeScore(ctx context.Context, state *framewor
 			scoresMap[nodeScore.Name].Score = framework.MinNodeScore
 		} else {
 			if nodeScore.Score == framework.MaxNodeScore {
-				cpu, memory, err := pl.FetchLiveHostMetrics(ctx, nodeScore.Name)
+				cpu, memory, err := pl.fetchHostMetrics(ctx, nodeScore.Name, 1)
 				if err != nil {
 					klog.Errorf("Final node utilization check failed for %v; will not assign: %v", nodeScore.Name, err)
-				} else if cpu >= float64(hostTargetUtilizationPercent) || memory > 60 {
+				} else if int64(cpu) >= hostTargetUtilizationPercent || memory > 60 {
 					klog.V(6).InfoS("Final node utilization check found node is overutilized; eliminating from consideration", "targetNode", nodeScore.Name, "cpu", cpu, "mem", memory)
 					pl.setNodeTaint(ctx, nodeScore.Name, true)
 					scoresMap[nodeScore.Name].Score = framework.MinNodeScore
