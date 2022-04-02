@@ -94,6 +94,11 @@ type TargetLoadPackingArgs struct {
 	DefaultRequestsMultiplier *string `json:"defaultRequestsMultiplier,omitempty"`
 	// Node target CPU Utilization for bin packing
 	TargetUtilization *int64 `json:"targetUtilization,omitempty"`
+	// Maximum memory utilization
+	MaximumMemoryUtilization *int64 `json:"maximumMemoryUtilization,omitempty"`
+	// Ignore pod requests.cpu & memory. Config
+	// must disable NodeResourcesFit.
+	AllowRequestsOvercommit *bool `json:"allowRequestsOvercommit,omitempty"`
 	// Specify the metric provider type, address and token using MetricProviderSpec
 	MetricProvider MetricProviderSpec `json:"metricProvider,omitempty"`
 	// Address of load watcher service

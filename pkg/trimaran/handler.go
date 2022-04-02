@@ -42,7 +42,6 @@ var _ clientcache.ResourceEventHandler = &PodAssignEventHandler{}
 type PodAssignEventHandler struct {
 	// Maintains the node-name to podInfo mapping for pods successfully bound to nodes
 	ScheduledPodsCache map[string]map[string]podInfo
-	onPodAssign func(*v1.Pod)
 	sync.RWMutex
 }
 
@@ -54,10 +53,9 @@ type podInfo struct {
 }
 
 // Returns a new instance of PodAssignEventHandler, after starting a background go routine for cache cleanup
-func New(onPodAssign func(*v1.Pod)) *PodAssignEventHandler {
+func New() *PodAssignEventHandler {
 	p := PodAssignEventHandler{
 		ScheduledPodsCache: make(map[string]map[string]podInfo),
-		onPodAssign: onPodAssign,
 	}
 	go func() {
 		cacheCleanerTicker := time.NewTicker(time.Minute * cacheCleanupIntervalMinutes)
@@ -71,9 +69,6 @@ func New(onPodAssign func(*v1.Pod)) *PodAssignEventHandler {
 func (p *PodAssignEventHandler) OnAdd(obj interface{}) {
 	pod := obj.(*v1.Pod)
 	klog.V(6).InfoS("Adding pod", "pod", klog.KObj(pod))
-	if len(pod.Spec.NodeName) != 0 && p.onPodAssign != nil {
-		go p.onPodAssign(pod)
-	}
 	p.updateCache(pod)
 }
 
@@ -84,9 +79,6 @@ func (p *PodAssignEventHandler) OnUpdate(oldObj, newObj interface{}) {
 
 	if oldPod.Spec.NodeName != newPod.Spec.NodeName {
 		p.removePodInfo(oldPod)
-		if p.onPodAssign != nil {
-			go p.onPodAssign(newPod)
-		}
 	}
 	p.setPodInfo(newPod)
 }

@@ -5,13 +5,13 @@ import (
 )
 
 type MetricsSample struct {
-	CpuUtil    int
-	MemoryUtil int
+	CpuMillis int64
+	Memory    int64
 }
 
 type MetricAdder struct {
-	CpuUtil    int
-	MemoryUtil int
+	CpuMillis int64
+	Memory    int64
 }
 
 type FreshMetricsMap struct {
@@ -30,21 +30,21 @@ func NewFreshMetricsMap(ln int, sampleMaxTTL int64, adderLifetime int64) (m *Fre
 	return
 }
 
-func (m *FreshMetricsMap) Put(nodeName string, cpuUtil int, memoryUtil int) *MetricsSample {
+func (m *FreshMetricsMap) Put(nodeName string, cpuMillis int64, memory int64) *MetricsSample {
 	value := &MetricsSample{
-		CpuUtil: cpuUtil,
-		MemoryUtil: memoryUtil,
+		CpuMillis: cpuMillis,
+		Memory:    memory,
 	}
 	m.samples.Put(nodeName, value)
 	return value
 }
 
-func (m *FreshMetricsMap) AddAdder(nodeName string, cpuUtil int, memoryUtil int) {
+func (m *FreshMetricsMap) AddAdder(nodeName string, cpuMillis int64, memory int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	newAdder := &MetricAdder{
-		CpuUtil: cpuUtil,
-		MemoryUtil: memoryUtil,
+		CpuMillis: cpuMillis,
+		Memory:    memory,
 	}
 	storedInt := m.adders.Get(nodeName, m.adderLifetime)
 	if storedInt != nil {
@@ -52,8 +52,8 @@ func (m *FreshMetricsMap) AddAdder(nodeName string, cpuUtil int, memoryUtil int)
 		// Stack any current adder on this one. This will give old
 		// adder values a longer functional effect, but that
 		// should be fine.
-		newAdder.CpuUtil += stored.CpuUtil
-		newAdder.MemoryUtil += stored.MemoryUtil
+		newAdder.CpuMillis += stored.CpuMillis
+		newAdder.Memory += stored.Memory
 	}
 	m.adders.Put(nodeName, newAdder)
 }
@@ -70,8 +70,8 @@ func (m *FreshMetricsMap) processAdder(nodeName string, sample *MetricsSample ) 
 		return sample
 	} else {
 		computed := &MetricsSample{
-			CpuUtil: sample.CpuUtil + adder.CpuUtil,
-			MemoryUtil: sample.MemoryUtil + adder.MemoryUtil,
+			CpuMillis: sample.CpuMillis + adder.CpuMillis,
+			Memory:    sample.Memory + adder.Memory,
 		}
 		return computed
 	}
@@ -90,7 +90,7 @@ func (m *FreshMetricsMap) Get(nodeName string, noOlderThan int64) *MetricsSample
 
 
 // GetOrPut helps make sure that
-func (m *FreshMetricsMap) GetOrPut(nodeName string, noOlderThan int64, getValues func()(int, int, error)) (*MetricsSample, error) {
+func (m *FreshMetricsMap) GetOrPut(nodeName string, noOlderThan int64, getValues func()(int64, int64, error)) (*MetricsSample, error) {
 
 	// Don't return value directly -- use m.Get afterward to include adders
 	stored, err := m.samples.GetOrPut(nodeName, noOlderThan, func()(interface{}, error){
@@ -99,8 +99,8 @@ func (m *FreshMetricsMap) GetOrPut(nodeName string, noOlderThan int64, getValues
 			return nil, err
 		}
 		return &MetricsSample{
-			CpuUtil: cpu,
-			MemoryUtil: memory,
+			CpuMillis: cpu,
+			Memory:    memory,
 		}, nil
 	})
 

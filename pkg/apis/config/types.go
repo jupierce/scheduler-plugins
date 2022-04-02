@@ -95,6 +95,11 @@ type TargetLoadPackingArgs struct {
 	DefaultRequestsMultiplier string
 	// Node target CPU Utilization for bin packing
 	TargetUtilization int64
+	// Maximum memory utilization
+	MaximumMemoryUtilization int64
+	// Ignore pod requests.cpu & memory. Config
+	// must disable NodeResourcesFit.
+	AllowRequestsOvercommit bool
 	// Metric Provider to use when using load watcher as a library
 	MetricProvider MetricProviderSpec
 	// Address of load watcher service
