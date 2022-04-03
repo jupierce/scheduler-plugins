@@ -1,4 +1,4 @@
-package targetloadpacking
+package gravity
 
 import (
 	"sync"
@@ -15,16 +15,16 @@ type MetricAdder struct {
 }
 
 type FreshMetricsMap struct {
-	samples *FreshMap
-	adders *FreshMap
+	samples       *FreshMap
+	adders        *FreshMap
 	adderLifetime int64
-	mu sync.Mutex
+	mu            sync.Mutex
 }
 
 func NewFreshMetricsMap(ln int, sampleMaxTTL int64, adderLifetime int64) (m *FreshMetricsMap) {
 	m = &FreshMetricsMap{
-		samples: NewFreshMap(ln, sampleMaxTTL),
-		adders: NewFreshMap(ln, adderLifetime + 5),
+		samples:       NewFreshMap(ln, sampleMaxTTL),
+		adders:        NewFreshMap(ln, adderLifetime+5),
 		adderLifetime: adderLifetime,
 	}
 	return
@@ -58,7 +58,7 @@ func (m *FreshMetricsMap) AddAdder(nodeName string, cpuMillis int64, memory int6
 	m.adders.Put(nodeName, newAdder)
 }
 
-func (m *FreshMetricsMap) processAdder(nodeName string, sample *MetricsSample ) *MetricsSample {
+func (m *FreshMetricsMap) processAdder(nodeName string, sample *MetricsSample) *MetricsSample {
 	var adder *MetricAdder
 	adderInt := m.adders.Get(nodeName, m.adderLifetime)
 	if adderInt != nil {
@@ -77,7 +77,6 @@ func (m *FreshMetricsMap) processAdder(nodeName string, sample *MetricsSample ) 
 	}
 }
 
-
 func (m *FreshMetricsMap) Get(nodeName string, noOlderThan int64) *MetricsSample {
 	var stored *MetricsSample
 	storedInt := m.samples.Get(nodeName, noOlderThan)
@@ -88,12 +87,11 @@ func (m *FreshMetricsMap) Get(nodeName string, noOlderThan int64) *MetricsSample
 	return nil
 }
 
-
 // GetOrPut helps make sure that
-func (m *FreshMetricsMap) GetOrPut(nodeName string, noOlderThan int64, getValues func()(int64, int64, error)) (*MetricsSample, error) {
+func (m *FreshMetricsMap) GetOrPut(nodeName string, noOlderThan int64, getValues func() (int64, int64, error)) (*MetricsSample, error) {
 
 	// Don't return value directly -- use m.Get afterward to include adders
-	stored, err := m.samples.GetOrPut(nodeName, noOlderThan, func()(interface{}, error){
+	stored, err := m.samples.GetOrPut(nodeName, noOlderThan, func() (interface{}, error) {
 		cpu, memory, err := getValues()
 		if err != nil {
 			return nil, err

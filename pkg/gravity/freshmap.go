@@ -1,4 +1,4 @@
-package targetloadpacking
+package gravity
 
 import (
 	"sync"
@@ -6,14 +6,14 @@ import (
 )
 
 type item struct {
-	v interface{}
+	v          interface{}
 	creationTs int64
 }
 
 type FreshMap struct {
-	items  map[string]*item
-	maxTTL int64
-	l sync.Mutex
+	items      map[string]*item
+	maxTTL     int64
+	l          sync.Mutex
 	getOrLocks map[string]*sync.Mutex
 }
 
@@ -54,7 +54,7 @@ func (m *FreshMap) Get(k string, noOlderThan int64) interface{} {
 	m.l.Lock()
 	defer m.l.Unlock()
 	if it, ok := m.items[k]; ok {
-		if noOlderThan == 0 || time.Now().Unix() - it.creationTs > noOlderThan {
+		if noOlderThan == 0 || time.Now().Unix()-it.creationTs > noOlderThan {
 			// The sample is too old for the caller
 			return nil
 		}
@@ -66,7 +66,7 @@ func (m *FreshMap) Get(k string, noOlderThan int64) interface{} {
 // GetOrPut helps make sure that if there are a queue of threads attempting
 // to get a value, only one will make the actual heavyweight request for
 // the latest value.
-func (m *FreshMap) GetOrPut(k string, noOlderThan int64, getValue func()(interface{}, error)) (interface{}, error) {
+func (m *FreshMap) GetOrPut(k string, noOlderThan int64, getValue func() (interface{}, error)) (interface{}, error) {
 	m.l.Lock()
 	keyLock, ok := m.getOrLocks[k]
 	if !ok {

@@ -19,6 +19,8 @@ package main
 import (
 	"math/rand"
 	"os"
+	"sigs.k8s.io/scheduler-plugins/pkg/gravity"
+	"sigs.k8s.io/scheduler-plugins/pkg/trimaran/targetloadpacking"
 	"time"
 
 	"k8s.io/component-base/logs"
@@ -33,8 +35,6 @@ import (
 	"sigs.k8s.io/scheduler-plugins/pkg/preemptiontoleration"
 	"sigs.k8s.io/scheduler-plugins/pkg/qos"
 	"sigs.k8s.io/scheduler-plugins/pkg/trimaran/loadvariationriskbalancing"
-	"sigs.k8s.io/scheduler-plugins/pkg/trimaran/targetloadpacking"
-
 	// Ensure scheme package is initialized.
 	_ "sigs.k8s.io/scheduler-plugins/pkg/apis/config/scheme"
 )
@@ -53,6 +53,7 @@ func main() {
 		app.WithPlugin(noderesourcetopology.Name, noderesourcetopology.New),
 		app.WithPlugin(preemptiontoleration.Name, preemptiontoleration.New),
 		app.WithPlugin(targetloadpacking.Name, targetloadpacking.New),
+		app.WithPlugin(gravity.Name, gravity.New),
 		// Sample plugins below.
 		app.WithPlugin(crossnodepreemption.Name, crossnodepreemption.New),
 		app.WithPlugin(podstate.Name, podstate.New),
