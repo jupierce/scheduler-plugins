@@ -95,11 +95,6 @@ type TargetLoadPackingArgs struct {
 	DefaultRequestsMultiplier string
 	// Node target CPU Utilization for bin packing
 	TargetUtilization int64
-	// Maximum memory utilization
-	MaximumMemoryUtilization int64
-	// Ignore pod requests.cpu & memory. Config
-	// must disable NodeResourcesFit.
-	AllowRequestsOvercommit bool
 	// Metric Provider to use when using load watcher as a library
 	MetricProvider MetricProviderSpec
 	// Address of load watcher service
@@ -120,6 +115,53 @@ type LoadVariationRiskBalancingArgs struct {
 	SafeVarianceMargin float64
 	// Root power of standard deviation in risk value
 	SafeVarianceSensitivity float64
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// GravityArgs holds plugin arguments used to configure Gravity scheduler plugin.
+type GravityArgs struct {
+	metav1.TypeMeta
+
+	// Node target CPU Utilization for bin packing
+	TargetUtilization int64
+
+	// When a pod is scheduled to a node, its impact on the CPU & memory
+	// will not be immediate. Gravity will temporarily consider Pod
+	// container requests as part of measured resource usage on the Node.
+	// These requests will be considered for this time period (seconds)
+	// before the Pod must actually start using those resources.
+	// For example, if TargetUtilization is 50% and a Pod requests
+	// 60% of the CPU, the scheduler will not consider adding more
+	// Pods to the node for AdderTTL seconds. After the adder expires
+	// the scheduler will only be looking at real utilization for the
+	// Pod. If it is consuming < TargetUtilization, more Pods may be
+	// scheduled to the Node.
+	// In short, how long should the scheduler wait for the Pod to
+	// start consuming the resources it claims to? Defaults to
+	// 60 seconds.
+	AdderTTL int64
+
+	// Maximum memory utilization
+	MaximumMemoryUtilization int64
+
+	WebHook GravityWebhookConfig
+}
+
+type GravityWebhookConfig struct {
+	// Port is the port number that the server will serve.
+	// It will be defaulted to 9443 if unspecified.
+	Port int
+
+	// CertDir is the directory that contains the server key and certificate. The
+	// server key and certificate.
+	CertDir string
+
+	// CertName is the server certificate name. Defaults to tls.crt.
+	CertName string
+
+	// KeyName is the server key name. Defaults to tls.key.
+	KeyName string
 }
 
 // ScoringStrategyType is a "string" type.

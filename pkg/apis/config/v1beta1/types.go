@@ -130,6 +130,38 @@ type LoadVariationRiskBalancingArgs struct {
 	SafeVarianceSensitivity *float64 `json:"safeVarianceSensitivity,omitempty"`
 }
 
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +k8s:defaulter-gen=true
+
+// GravityArgs holds plugin arguments used to configure Gravity scheduler plugin.
+type GravityArgs struct {
+	metav1.TypeMeta `json:",inline"`
+
+	// Node target CPU Utilization for bin packing
+	TargetUtilization *int64 `json:"targetUtilization,omitempty"`
+
+	// Maximum memory utilization
+	MaximumMemoryUtilization *int64 `json:"maximumMemoryUtilization,omitempty"`
+
+	Webhook *GravityWebhookConfig `json:"webhook, omitempty"`
+}
+
+type GravityWebhookConfig struct {
+	// Port is the port number that the server will serve.
+	// It will be defaulted to 9443 if unspecified.
+	Port *int `json:"port, omitempty"`
+
+	// CertDir is the directory that contains the server key and certificate. The
+	// server key and certificate.
+	CertDir *string `json:"certDir, omitempty"`
+
+	// CertName is the server certificate name. Defaults to tls.crt.
+	CertName *string `json:"certName, omitempty"`
+
+	// KeyName is the server key name. Defaults to tls.key.
+	KeyName *string `json:"keyName, omitempty"`
+}
+
 // ScoringStrategyType is a "string" type.
 type ScoringStrategyType string
 

@@ -19,7 +19,6 @@ package gravity
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -28,6 +27,7 @@ import (
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/util/taints"
 	"os"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,9 +49,15 @@ import (
 )
 
 const (
-	Name                             = "Gravity"
-	SchedulerTaintName               = "gravity-scheduler.k8s.io/overloaded"
-	OvercommitRequestsAnnotationName = "ci-scheduler.openshift.io/overcommit-requests"
+	Name               = "Gravity"
+	SchedulerTaintName = "gravity-scheduler.openshift.io/overloaded"
+
+	// OvercommitRequestsAnnotationName If the webhook is turned on and this annotation == "true" in the Pod, its
+	// requested resources will be cleared and will only be used as adders to the node.
+	OvercommitRequestsAnnotationName = "gravity-scheduler.openshift.io/overcommit-requests"
+
+	OvercommitCPUHintAnnotationName    = "gravity-scheduler.openshift.io/requests-cpu"
+	OvercommitMemoryHintAnnotationName = "gravity-scheduler.openshift.io/requests-memory"
 )
 
 var (
@@ -71,6 +77,8 @@ type Gravity struct {
 	metricsClient   metricsv.Interface
 	k8sClient       clientset.Interface
 	freshMetricsMap *FreshMetricsMap
+	decoder         *admission.Decoder
+	config          *pluginConfig.GravityArgs
 }
 
 func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) {
@@ -208,13 +216,24 @@ func (gravity *Gravity) onPodAssign(pod *v1.Pod) {
 		// Ignore pods which were scheduled to nodes before we started
 		// scheduling.
 		if pod.GetCreationTimestamp().Unix() > gravity.startTime {
-			cpuAdder := fakeNodeInfo.Requested.MilliCPU
-			if cpuAdder < 100 {
-				// if the pod is claiming very low CPU requests, reserve a reasonable amount
-				// until it shows us what it really needs.
-				cpuAdder = 500
-			}
+
+			var err error
+			cpuAdder := fakeNodeInfo.NonZeroRequested.MilliCPU
 			memoryAdder := fakeNodeInfo.NonZeroRequested.Memory
+			if pod.Annotations != nil {
+				if v, ok := pod.Annotations[OvercommitCPUHintAnnotationName]; ok {
+					cpuAdder, err = strconv.ParseInt(v, 10, 64)
+					if err != nil {
+						klog.Errorf("Error parsing %v value: %v: %v", OvercommitCPUHintAnnotationName, v, err)
+					}
+				}
+				if v, ok := pod.Annotations[OvercommitMemoryHintAnnotationName]; ok {
+					memoryAdder, err = strconv.ParseInt(v, 10, 64)
+					if err != nil {
+						klog.Errorf("Error parsing %v value: %v: %v", OvercommitMemoryHintAnnotationName, v, err)
+					}
+				}
+			}
 			klog.V(6).InfoS("Pod scheduled to node; supplying metrics adder", "nodeName", pod.Spec.NodeName, "pod", podName, "cpuAdder", cpuAdder, "memoryAdder", memoryAdder)
 			gravity.freshMetricsMap.AddAdder(pod.Spec.NodeName, cpuAdder, memoryAdder)
 		}
@@ -266,25 +285,19 @@ func (gravity *Gravity) Name() string {
 	return Name
 }
 
-func getArgs(obj runtime.Object) (*pluginConfig.TargetLoadPackingArgs, error) {
-	args, ok := obj.(*pluginConfig.TargetLoadPackingArgs)
+func getArgs(obj runtime.Object) (*pluginConfig.GravityArgs, error) {
+	/*args, ok := obj.(*pluginConfig.GravityArgs)
 	if !ok {
-		return nil, fmt.Errorf("want args to be of type TargetLoadPackingArgs, got %T", obj)
+		return nil, fmt.Errorf("args must be of type GravityArgs, got %T", obj)
 	}
-	if args.WatcherAddress == "" {
-		metricProviderType := string(args.MetricProvider.Type)
-		validMetricProviderType := metricProviderType == string(pluginConfig.KubernetesMetricsServer) ||
-			metricProviderType == string(pluginConfig.Prometheus) ||
-			metricProviderType == string(pluginConfig.SignalFx)
-		if !validMetricProviderType {
-			return nil, fmt.Errorf("invalid MetricProvider.Type, got %T", args.MetricProvider.Type)
+	*/
+	/*
+		_, err := strconv.ParseFloat(args.DefaultRequestsMultiplier, 64)
+		if err != nil {
+			return nil, errors.New("unable to parse DefaultRequestsMultiplier: " + err.Error())
 		}
-	}
-	_, err := strconv.ParseFloat(args.DefaultRequestsMultiplier, 64)
-	if err != nil {
-		return nil, errors.New("unable to parse DefaultRequestsMultiplier: " + err.Error())
-	}
-	return args, nil
+		return args, nil */
+	return nil, nil
 }
 
 func (gravity *Gravity) doesPodFitNode(ctx context.Context, pod *v1.Pod, nodeInfo *framework.NodeInfo, noOlderThan int64) (bool, error) {
