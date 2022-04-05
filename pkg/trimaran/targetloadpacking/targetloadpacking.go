@@ -14,11 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-/*
-targetloadpacking package provides K8s scheduler plugin for best-fit variant of bin packing based on CPU utilization around a target load
-It contains plugin for Score extension point.
-*/
-
 package targetloadpacking
 
 import (
@@ -32,7 +27,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/util/taints"
-	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -43,9 +37,7 @@ import (
 	"github.com/paypal/load-watcher/pkg/watcher"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	metricsv "k8s.io/metrics/pkg/client/clientset/versioned"
@@ -57,7 +49,8 @@ import (
 const (
 	Name               = "TargetLoadPacking"
     SchedulerTaintName = "ci-scheduler.openshift.io/overloaded"
-	OvercommitRequestsAnnotationName = "ci-scheduler.openshift.io/overcommit-requests"
+	OvercommitRequestsAnnotationName   = "gravity-scheduler.openshift.io/overcommit-requests"
+	TargetUtilizationOverrideLabelName = "gravity-scheduler.openshift.io/node-target-utilization"
 )
 
 var (
@@ -79,6 +72,7 @@ type TargetLoadPacking struct {
 	metricsClient metricsv.Interface
 	k8sClient       clientset.Interface
 	freshMetricsMap *FreshMetricsMap
+	args *pluginConfig.TargetLoadPackingArgs
 }
 
 func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) {
@@ -107,56 +101,35 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 	if err != nil {
 		return nil, err
 	}
-	hostTargetUtilizationPercent = args.TargetUtilization
-	//hostMaximumMemoryUtilization = args.MaximumMemoryUtilization
-	//allowRequestsOverCommit = args.AllowRequestsOvercommit  // not sure why this isn't coming through
-	requestsMilliCores = args.DefaultRequests.Cpu().MilliValue()
-	requestsMultiplier, _ = strconv.ParseFloat(args.DefaultRequestsMultiplier, 64)
 
 	pl := &TargetLoadPacking{
 		handle:          handle,
 		k8sClient:       handle.ClientSet(),
 		metricsClient:   metricsClient,
 		freshMetricsMap: NewFreshMetricsMap(0, 220, 60),
+		args: args,
+	}
+
+	hostTargetUtilizationPercent = pl.args.TargetUtilization
+	requestsMilliCores = pl.args.DefaultRequests.Cpu().MilliValue()
+	requestsMultiplier, _ = strconv.ParseFloat(pl.args.DefaultRequestsMultiplier, 64)
+
+	if requestsMultiplier < 1 {
+		// We can't support < 1 or we might overschedule and the kubelet will
+		// eventually reject the work.
+		requestsMultiplier = 1
 	}
 
 	pl.startTime = time.Now().Unix()
 
-	pl.handle.SharedInformerFactory().Core().V1().Pods().Informer().AddEventHandler(
-		cache.FilteringResourceEventHandler{
-			FilterFunc: func(obj interface{}) bool {
-				switch t := obj.(type) {
-				case *v1.Pod:
-					return isAssigned(t)
-				case cache.DeletedFinalStateUnknown:
-					if pod, ok := t.Obj.(*v1.Pod); ok {
-						return isAssigned(pod)
-					}
-					klog.Errorf("unable to convert object %T to *v1.Pod in %T", obj, pl)
-					utilruntime.HandleError(fmt.Errorf("unable to convert object %T to *v1.Pod in %T", obj, pl))
-					return false
-				default:
-					klog.Errorf("unable to handle object in %T: %T", pl, obj)
-					utilruntime.HandleError(fmt.Errorf("unable to handle object in %T: %T", pl, obj))
-					return false
-				}
-			},
-			Handler: pl,
-		},
-	)
-
 	go func() {
 		ctx := context.TODO()
 		for {
-			nodeList, err := pl.k8sClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+			err := pl.refreshAllNodeMetrics(ctx)
 			if err != nil  {
 				klog.Errorf("Unable to retrieve node list periodic metric refresh: %v", err)
-				continue
 			}
-			for _, node := range nodeList.Items {
-				pl.fetchNodeMetrics(ctx, node.Name, 5)
-				time.Sleep(1)
-			}
+			time.Sleep(2 * time.Second)
 		}
 	}()
 
@@ -174,20 +147,22 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 				continue
 			}
 
-			taintedNodeNames := make([]string, 0)
-			for _, node := range nodeList.Items {
+			taintedNodeNames := make([]*v1.Node, 0)
+			for i := range nodeList.Items {
+				node := &nodeList.Items[i]
 				if taints.TaintExists(node.Spec.Taints, &SchedulerTaint) {
-					taintedNodeNames = append(taintedNodeNames, node.Name)
+					taintedNodeNames = append(taintedNodeNames, &nodeList.Items[i])
 				}
 			}
 
-			for _, nodeName := range taintedNodeNames {
+			for _, node := range taintedNodeNames {
+				nodeName := node.Name
 				untaintTarget := int(float64(hostTargetUtilizationPercent) * 0.8)
-				cpuUtilPercent, memoryUtilPercent, err := pl.fetchNodeMetricPercentages(ctx, nodeName, 30)
+				cpuUtilPercent, memoryUtilPercent, err := pl.fetchNodeMetricPercentages(ctx, node, 30)
 				if err == nil {
 					klog.V(6).InfoS("During tainting check node utilization", "nodeName", nodeName, "cpu", cpuUtilPercent, "memory", memoryUtilPercent, "cpuTarget%", untaintTarget)
 					if cpuUtilPercent < untaintTarget {
-						pl.setNodeTaint(ctx, nodeName, false)
+						pl.setNodeTaint(ctx, node.Name, false)
 					}
 				} else {
 					klog.Errorf("Unable to retrieve node %v metrics for tainting check: %v", nodeName, err)
@@ -200,54 +175,23 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 	return pl, nil
 }
 
-
-func (pl *TargetLoadPacking)  onPodAssign(pod *v1.Pod) {
-// When a pod is assigned to a node, its impact to the CPU may not be felt for some time.
-// To prevent a flood of pods from quickly being assigned to a seemingly underutilized nodes
-// and those pods subsequently consuming > 100% of the CPU, we create a temporary adder
-// to the node. This adder will increase all measured samples for the adderLifetime.
-// This is particularly important if there is only one feasible node for a Pod. In this
-// case, neither Score nor Normalize will be called -- only Filter.
-// To be performant, Filter can only pull delayed metrics from the node (on average),
-// so a quick influx of Pods can easily trick Filter into permitting the Pod
-// to the same node again and again -- until the node metrics eventually catch up.
-// By the time they catch up, it is too late. Adders provide a guard against this
-// situation.
+func (pl *TargetLoadPacking)  getPodAdder(pod *v1.Pod) (int64, int64) {
 	if pod != nil {
 		fakeNodeInfo := framework.NewNodeInfo(pod)
-		podName := pod.Namespace + "/" + pod.Name
 		// Ignore pods which were scheduled to nodes before we started
 		// scheduling.
 		if pod.GetCreationTimestamp().Unix() > pl.startTime {
-			cpuAdder := fakeNodeInfo.Requested.MilliCPU
+			cpuAdder := int64(float64(fakeNodeInfo.Requested.MilliCPU) * requestsMultiplier)
 			if cpuAdder < 100 {
 				// if the pod is claiming very low CPU requests, reserve a reasonable amount
 				// until it shows us what it really needs.
 				cpuAdder = 500
 			}
 			memoryAdder := fakeNodeInfo.NonZeroRequested.Memory
-			klog.V(6).InfoS("Pod scheduled to node; supplying metrics adder", "nodeName", pod.Spec.NodeName, "pod", podName, "cpuAdder", cpuAdder, "memoryAdder", memoryAdder)
-			pl.freshMetricsMap.AddAdder(pod.Spec.NodeName, cpuAdder, memoryAdder)
+			return cpuAdder, memoryAdder
 		}
 	}
-}
-
-func (pl *TargetLoadPacking) OnAdd(obj interface{}) {
-	pod := obj.(*v1.Pod)
-	if len(pod.Spec.NodeName) != 0  {
-		pl.onPodAssign(pod)
-	}
-}
-
-func (pl *TargetLoadPacking) OnUpdate(oldObj, newObj interface{}) {
-	oldPod := oldObj.(*v1.Pod)
-	newPod := newObj.(*v1.Pod)
-	if oldPod.Spec.NodeName != newPod.Spec.NodeName {
-		pl.onPodAssign(newPod)
-	}
-}
-
-func (pl *TargetLoadPacking) OnDelete(obj interface{}) {
+	return 0, 0
 }
 
 func (pl *TargetLoadPacking) Filter(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
@@ -259,17 +203,24 @@ func (pl *TargetLoadPacking) Filter(ctx context.Context, cycleState *framework.C
 	fits, err := pl.doesPodFitNode(ctx, pod, nodeInfo, 10)
 
 	if err != nil {
-		pl.setNodeTaint(ctx, nodeName, true)
-		klog.Errorf("Unable to check node %v metrics: %v", nodeName, err)
+		// Don't taint. doesPodFitNode will have done this for an error, when appropriate.
+		klog.Errorf("Unable to check pod %v node fit %v: %v", podName, nodeName, err)
 		return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("Unable to check node %v metrics: %v", nodeName, err))
 	}
+
 	if ! fits {
 		klog.V(6).InfoS("Filter() will NOT consider node with utilization", "nodeName", nodeName, "pod", podName)
 		pl.setNodeTaint(ctx, nodeName, true)
 		return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("Node %v is heavily utilized", nodeName))
 	}
 
-	klog.V(6).InfoS("Filter() WILL consider node", "nodeName", nodeName, "pod", podName)
+	// Unfortunately, if there is only one node, other lifecycle methods like Score() and NormalizeScore()
+	// will not be called. So Filter() has to assume that there may only be one node and that Filter() is the final
+	// decider. Thus, add the pod Adder now for all nodes and then remove it from unselected nodes
+	// once IF Score() is called.
+	cpuAdder, memoryAdder := pl.getPodAdder(pod)
+	pl.freshMetricsMap.AddAdder(nodeName, cpuAdder, memoryAdder)
+	klog.V(6).InfoS("Filter() WILL consider node", "nodeName", nodeName, "pod", podName, "cpuAdder", cpuAdder, "memoryAdder", memoryAdder)
 	return nil
 }
 
@@ -302,13 +253,6 @@ func (pl *TargetLoadPacking) doesPodFitNode(ctx context.Context, pod *v1.Pod, no
 	incomingPodName := pod.ObjectMeta.Namespace + "/" + pod.Name
 	nodeName := nodeInfo.Node().Name
 
-	// Construct a fake node to calculate requests
-	fakeNodeInfo := framework.NewNodeInfo(pod)
-	incomingRequestCPUMillis := fakeNodeInfo.Requested.MilliCPU
-	incomingRequestMemory := fakeNodeInfo.Requested.Memory // bytes
-
-	klog.V(6).InfoS("Requests for incoming pod", "podName", incomingPodName, "millis", incomingRequestCPUMillis)
-
 	nodeCPUMillisUsed, nodeMemoryUsed, err := pl.fetchNodeMetrics(ctx, nodeName, noOlderThan)
 	if err != nil {
 		klog.ErrorS(nil, "CPU & memory metric not found for node", "nodeName")
@@ -318,6 +262,30 @@ func (pl *TargetLoadPacking) doesPodFitNode(ctx context.Context, pod *v1.Pod, no
 
 	nodeAllocatableCPUMillis := nodeInfo.Allocatable.MilliCPU
 	nodeAllocatableMemory := nodeInfo.Allocatable.Memory
+
+	// Construct a fake node to calculate requests
+	fakeNodeInfo := framework.NewNodeInfo(pod)
+	incomingRequestCPUMillis := fakeNodeInfo.Requested.MilliCPU
+
+	if incomingRequestCPUMillis > nodeAllocatableCPUMillis {
+		klog.ErrorS(nil, "Pod requests greater than all allocatable CPU", "nodeName", "podRequest", incomingRequestCPUMillis, "allocatable", nodeAllocatableCPUMillis)
+		// Don't taint. Just let normal resource utilization filtering take over.
+		return false, err
+	}
+
+	testCPUMillis := int64(float64(incomingRequestCPUMillis) * requestsMultiplier)
+	maxMillis := hostTargetUtilizationPercent * nodeAllocatableCPUMillis / 100
+	if testCPUMillis > maxMillis {
+		// our request can't be larger than the node allocatable or
+		// we continue to scale the cluster and never be able to seat the pod.
+		incomingRequestCPUMillis = maxMillis
+	} else {
+		incomingRequestCPUMillis = testCPUMillis
+	}
+
+	incomingRequestMemory := fakeNodeInfo.Requested.Memory // bytes
+
+	klog.V(6).InfoS("Requests for incoming pod", "podName", incomingPodName, "millis", incomingRequestCPUMillis)
 
 	inUseCPUPercent := int((100 * nodeCPUMillisUsed) / nodeAllocatableCPUMillis)
 	inUseMemoryPercent := int((100 * nodeMemoryUsed) / nodeAllocatableMemory)
@@ -330,12 +298,13 @@ func (pl *TargetLoadPacking) doesPodFitNode(ctx context.Context, pod *v1.Pod, no
 	)
 
 
-	scheduledRequestedCPUMillis := nodeInfo.Requested.MilliCPU
+	scheduledRequestedCPUMillis := int64(float64(nodeInfo.Requested.MilliCPU) * requestsMultiplier)
 	scheduledRequestedMemory := nodeInfo.Requested.Memory
 	podCount := len(nodeInfo.Pods)
 
 	klog.V(6).InfoS("Existing requests for node",
 		"nodeName", nodeName,
+		"requestsMultiplier", requestsMultiplier,
 		"scheduledRequestedCPUMillis", scheduledRequestedCPUMillis,
 		"scheduledRequestedMemory", scheduledRequestedMemory,
 		"podCount", podCount,
@@ -390,6 +359,12 @@ func (pl *TargetLoadPacking) Score(ctx context.Context, cycleState *framework.Cy
 	// this pod will NOT fit. So everything remaining gets max score.
 	var score = framework.MaxNodeScore
 	klog.V(6).InfoS("Score for host", "nodeName", nodeName, "score", score)
+
+	// Remove the Adder that Filter() would have added since the framework will call NormalizeScore
+	// next -- which does a final check on fit.
+	cpuAdder, memoryAdder := pl.getPodAdder(pod)
+	pl.freshMetricsMap.AddAdder(nodeName, -1*cpuAdder, -1*memoryAdder)
+
 	return score, framework.NewStatus(framework.Success, "")
 }
 
@@ -461,7 +436,7 @@ func (pl *TargetLoadPacking) fetchNodeMetrics(ctx context.Context, nodeName stri
 		func() (int64, int64, error) {
 			cpuMillis, memory, err := pl._fetchLiveHostMetrics(ctx, nodeName)
 			if err != nil {
-				return 0, 0, fmt.Errorf("unable to refresh latest node metrics: %v", err)
+				return 0, 0, fmt.Errorf("unable to refresh latest node metrics for %v: %v", nodeName, err)
 			}
 			return cpuMillis, memory, nil
 		},
@@ -472,7 +447,20 @@ func (pl *TargetLoadPacking) fetchNodeMetrics(ctx context.Context, nodeName stri
 	return metricsSample.CpuMillis, metricsSample.Memory, nil
 }
 
-func (pl *TargetLoadPacking) fetchNodeMetricPercentages(ctx context.Context, nodeName string, noOlderThan int64) (int, int, error) {
+func (pl *TargetLoadPacking) refreshAllNodeMetrics(ctx context.Context) error {
+	metrics, err := pl.metricsClient.MetricsV1beta1().NodeMetricses().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		klog.Errorf("Unable to list all node metrics: %v", err)
+		return err
+	}
+	for _, v := range metrics.Items {
+		pl.freshMetricsMap.Put(v.Name, v.Usage.Cpu().MilliValue(), v.Usage.Memory().Value())
+	}
+	return nil
+}
+
+func (pl *TargetLoadPacking) fetchNodeMetricPercentages(ctx context.Context, node *v1.Node, noOlderThan int64) (int, int, error) {
+	nodeName := node.Name
 	nodeInfo, err := pl.handle.SnapshotSharedLister().NodeInfos().Get(nodeName)
 
 	if err != nil {
@@ -527,6 +515,10 @@ func (pl *TargetLoadPacking) NormalizeScore(ctx context.Context, state *framewor
 						if !fits {
 							klog.V(6).InfoS("Final node utilization check found node is overutilized; eliminating from consideration", "targetNode", nodeScore.Name, "pod", podName)
 						} else {
+							// A final update to the Adder. It would be really nice if Score/NormalizeScore were called
+							// if there were more than 1 feasible, node, but that will take upstream changes.
+							cpuAdder, memoryAdder := pl.getPodAdder(pod)
+							pl.freshMetricsMap.AddAdder(nodeScore.Name, cpuAdder, memoryAdder)
 							klog.V(6).InfoS("Found first underutilized node; other nodes scores will be eliminated", "targetNode", nodeScore.Name, "score", nodeScore.Score)
 							targetNodeFound = true
 						}
@@ -534,10 +526,10 @@ func (pl *TargetLoadPacking) NormalizeScore(ctx context.Context, state *framewor
 				}
 
 				if err != nil {
-					klog.Errorf("Final node utilization failed for pod %v on %v; will not assign: %v", podName, nodeScore.Name, err)
-				}
-
-				if !targetNodeFound {
+					// No tainting here, doesPodFitNode should do so if it makes sense based on the error.
+					klog.Errorf("Final node utilization check failed for pod %v on %v; will not assign: %v", podName, nodeScore.Name, err)
+					scoresMap[nodeScore.Name].Score = framework.MinNodeScore
+				} else if !targetNodeFound {
 					pl.setNodeTaint(ctx, nodeScore.Name, true)
 					scoresMap[nodeScore.Name].Score = framework.MinNodeScore
 				}
@@ -553,48 +545,4 @@ func (pl *TargetLoadPacking) NormalizeScore(ctx context.Context, state *framewor
 	}
 
 	return nil
-}
-
-// Checks and returns true if the pod is assigned to a node
-func isAssigned(pod *v1.Pod) bool {
-	return len(pod.Spec.NodeName) != 0
-}
-
-func CalculatePodCPURequests(pod *v1.Pod) int64 {
-
-	var incomingPodCPUMillis int64
-	for _, container := range pod.Spec.Containers {
-		// non-init containers run simultaneously, so the requests are additive
-		incomingPodCPUMillis += CalculateContainerCPURequests(&container)
-	}
-
-	// In cases where init containers claim limits that exceed pod resources, the init resources/limits take over as the
-	// effective requested resources for the pod: https://kubernetes.io/docs/concepts/workloads/pods/init-containers/#resources
-	// Note that initContainers run sequentially, so we are only after the largest one.
-	var incomingPodInitCPUMillis int64
-	for _, container := range pod.Spec.InitContainers {
-		calc := CalculateContainerCPURequests(&container)
-		if calc > incomingPodInitCPUMillis {
-			incomingPodInitCPUMillis = calc
-		}
-	}
-
-	finalRequestMillis := incomingPodCPUMillis
-	if incomingPodInitCPUMillis > incomingPodCPUMillis {
-		finalRequestMillis = incomingPodInitCPUMillis
-	}
-
-	return finalRequestMillis
-}
-
-// CalculateContainerCPURequests Predict utilization for a container based on its requests/limits
-func CalculateContainerCPURequests(container *v1.Container) (milliCores int64) {
-	if _, ok := container.Resources.Limits[v1.ResourceCPU]; ok {
-		milliCores = container.Resources.Limits.Cpu().MilliValue()
-	} else if _, ok := container.Resources.Requests[v1.ResourceCPU]; ok {
-		milliCores = int64(math.Round(float64(container.Resources.Requests.Cpu().MilliValue()) * requestsMultiplier))
-	} else {
-		milliCores = requestsMilliCores
-	}
-	return
 }
