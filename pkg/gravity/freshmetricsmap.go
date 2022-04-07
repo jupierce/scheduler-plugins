@@ -1,6 +1,7 @@
 package gravity
 
 import (
+	"k8s.io/klog/v2"
 	"sync"
 )
 
@@ -54,6 +55,17 @@ func (m *FreshMetricsMap) AddAdder(nodeName string, cpuMillis int64, memory int6
 		// should be fine.
 		newAdder.CpuMillis += stored.CpuMillis
 		newAdder.Memory += stored.Memory
+
+		if newAdder.CpuMillis < 0 {
+			// This would indicate unbalanced add and subtracts and a program logic fault
+			klog.Errorf("Attempt was made to reduce CPU adder to below 0 for %v", nodeName)
+			newAdder.CpuMillis = 0
+		}
+		if newAdder.Memory < 0 {
+			// This would indicate unbalanced add and subtracts and a program logic fault
+			klog.Errorf("Attempt was made to reduce memory adder to below 0 for %v", nodeName)
+			newAdder.Memory = 0
+		}
 	}
 	m.adders.Put(nodeName, newAdder)
 }

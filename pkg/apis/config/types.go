@@ -142,8 +142,13 @@ type GravityArgs struct {
 	// 60 seconds.
 	AdderTTL int64
 
+	// Set >1 if workloads are underreporting their CPU utilization
+	DefaultCPURequestMultiplier string
+
 	// Maximum memory utilization
 	MaximumMemoryUtilization int64
+
+	MaximumPodsPerNode int
 
 	WebHook GravityWebhookConfig
 }

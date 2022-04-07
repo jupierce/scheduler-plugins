@@ -140,8 +140,13 @@ type GravityArgs struct {
 	// Node target CPU Utilization for bin packing
 	TargetUtilization *int64 `json:"targetUtilization,omitempty"`
 
+	// Set >1 if workloads are underreporting their CPU utilization
+	DefaultCPURequestMultiplier *string `json:"defaultCPURequestMultiplier,omitempty"`
+
 	// Maximum memory utilization
 	MaximumMemoryUtilization *int64 `json:"maximumMemoryUtilization,omitempty"`
+
+	MaximumPodsPerNode *int `json:"maximumPodsPerNode,omitempty"`
 
 	Webhook *GravityWebhookConfig `json:"webhook, omitempty"`
 }
