@@ -1,6 +1,4 @@
 /*
-Copyright 2020 The Kubernetes Authors.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -109,6 +107,10 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 	}
 	hostTargetUtilizationPercent = args.TargetUtilization
 	requestsMultiplier, _ = strconv.ParseFloat(args.DefaultCPURequestMultiplier, 64)
+
+	if len(args.InstanceName) > 0 {
+		SchedulerTaint.Value = args.InstanceName
+	}
 
 	gravity := &Gravity{
 		handle:          handle,
@@ -374,13 +376,15 @@ func (gravity *Gravity) setNodeTaint(ctx context.Context, nodeName string, doTai
 		return err
 	}
 
+	klog.V(6).InfoS("Changing taint of node", "nodeName", nodeName, "taint", SchedulerTaintName, "doTaint", doTaint)
+
 	if doTaint {
 		err := controller.AddOrUpdateTaintOnNode(gravity.k8sClient, nodeName, &SchedulerTaint)
 		if err != nil {
 			klog.Errorf("Unable to apply taint %v to %v: %v", SchedulerTaintName, nodeName, err)
 		}
 		// We also cordon to convince the autoscaler to add new nodes
-		_ = gravity.setNodeCordon(ctx, nodeName, true)
+		err = gravity.setNodeCordon(ctx, nodeName, true)
 		if err != nil {
 			klog.Errorf("Unable to apply cordon %v: %v", nodeName, err)
 		}
@@ -389,13 +393,12 @@ func (gravity *Gravity) setNodeTaint(ctx context.Context, nodeName string, doTai
 		if err != nil {
 			klog.Errorf("Unable to remove taint %v to %v: %v", SchedulerTaintName, nodeName, err)
 		}
-		_ = gravity.setNodeCordon(ctx, nodeName, false)
+		err = gravity.setNodeCordon(ctx, nodeName, false)
 		if err != nil {
 			klog.Errorf("Unable to remove cordon %v: %v", nodeName, err)
 		}
 	}
 
-	klog.V(6).InfoS("Successfully changed taint of node", "nodeName", nodeName, "taint", SchedulerTaintName, "doTaint", doTaint)
 	return nil
 }
 

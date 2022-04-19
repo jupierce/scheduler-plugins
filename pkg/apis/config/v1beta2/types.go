@@ -124,6 +124,16 @@ type LoadVariationRiskBalancingArgs struct {
 type GravityArgs struct {
 	metav1.TypeMeta `json:",inline"`
 
+	// If multiple instances of the scheduler are running,
+	// the instance name will differentiate them (e.g.
+	// the name of the taints they use). If multiple instances
+	// are to be used, pods scheduled with each instance MUST
+	// target different nodes via taints or nodeSelectors.
+	// Each instance will assume it has full management
+	// authority over the feasible nodes found for the pods
+	// it handles.
+	InstanceName *string `json:"instanceName,omitempty"`
+
 	// Node target CPU Utilization for bin packing
 	TargetUtilization *int64 `json:"targetUtilization,omitempty"`
 
