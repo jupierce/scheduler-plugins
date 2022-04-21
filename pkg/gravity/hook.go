@@ -66,7 +66,7 @@ func (gravity *Gravity) initWebhook(ctx context.Context) {
 
 func (gravity *Gravity) shouldAugment(pod *corev1.Pod) bool {
 	if pod.Annotations != nil {
-		if v, ok := pod.Annotations[OvercommitRequestsAnnotationName]; ok {
+		if v, ok := pod.Annotations[OvercommitCPURequestsAnnotationName]; ok {
 			if b, err := strconv.ParseBool(v); err == nil && b {
 				return true
 			}
@@ -85,18 +85,13 @@ func (gravity *Gravity) Handle(ctx context.Context, req admission.Request) admis
 	}
 
 	if gravity.shouldAugment(pod) {
-		if pod.Annotations == nil {
-			pod.Annotations = map[string]string{}
-		}
-
 		nodeInfo := framework.NewNodeInfo(pod)
 		pod.Annotations[OvercommitCPUHintAnnotationName] = strconv.FormatInt(nodeInfo.NonZeroRequested.MilliCPU, 10)
-		pod.Annotations[OvercommitMemoryHintAnnotationName] = strconv.FormatInt(nodeInfo.NonZeroRequested.Memory, 10)
 
 		reduceRequests := func(container *corev1.Container) {
 			requests := &container.Resources.Requests
 			if requests.Cpu() != nil {
-				requests.Cpu().Set(1)
+				requests.Cpu().Set(0)
 			}
 
 			// Limits must be cleared as well, otherwise they will be used for Requests
@@ -110,9 +105,10 @@ func (gravity *Gravity) Handle(ctx context.Context, req admission.Request) admis
 			for i, _ := range pod.Spec.InitContainers {
 				reduceRequests(&pod.Spec.InitContainers[i])
 			}
-			for i, _ := range pod.Spec.Containers {
-				reduceRequests(&pod.Spec.Containers[i])
-			}
+		}
+
+		for i, _ := range pod.Spec.Containers {
+			reduceRequests(&pod.Spec.Containers[i])
 		}
 
 	}

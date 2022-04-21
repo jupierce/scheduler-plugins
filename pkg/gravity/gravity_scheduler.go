@@ -48,12 +48,16 @@ const (
 	Name               = "Gravity"
 	SchedulerTaintName = "gravity-scheduler.openshift.io/overloaded"
 
-	// OvercommitRequestsAnnotationName If the webhook is turned on and this annotation == "true" in the Pod, its
-	// requested resources will be cleared and will only be used as adders to the node.
-	OvercommitRequestsAnnotationName = "gravity-scheduler.openshift.io/overcommit-requests"
+	// OvercommitCPURequestsAnnotationName If the webhook is turned on and this annotation == "true" in the Pod, its
+	// requested resources will be cleared and will only be used as adders to the node. The adders will be
+	// counted as consumed resources on the node for AdderTTL seconds. After that time, the pod should be
+	// actually consuming the CPU it will require (i.e. CPU metrics from the node should reflect the pods
+	// activity accurately).
+	OvercommitCPURequestsAnnotationName = "gravity-scheduler.openshift.io/overcommit-cpu-requests"
 
-	OvercommitCPUHintAnnotationName    = "gravity-scheduler.openshift.io/requests-cpu"
-	OvercommitMemoryHintAnnotationName = "gravity-scheduler.openshift.io/requests-memory"
+	// OvercommitCPUHintAnnotationName Used by the webhook to squirrel away the original CPU requested by the pod.
+	// This will be used as the adder for the Pod.
+	OvercommitCPUHintAnnotationName = "gravity-scheduler.openshift.io/original-cpu-requests"
 )
 
 var (
@@ -177,10 +181,22 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 
 func (gravity *Gravity) getPodAdder(pod *v1.Pod) (int64, int64) {
 	if pod != nil {
-		fakeNodeInfo := framework.NewNodeInfo(pod)
 		// Ignore pods which were scheduled to nodes before we started
 		// scheduling.
 		if pod.GetCreationTimestamp().Unix() > gravity.startTime {
+			fakeNodeInfo := framework.NewNodeInfo(pod)
+
+			if pod.Annotations != nil {
+				if stringVal, ok := pod.Annotations[OvercommitCPUHintAnnotationName]; ok {
+					val, err := strconv.ParseInt(stringVal, 10, 64)
+					if err != nil {
+						klog.Errorf("unable to parse %v annotation in pod %v: %v", OvercommitCPUHintAnnotationName, pod.Name, err)
+						val = 500 // Give the pod something to work with
+					}
+					fakeNodeInfo.Requested.MilliCPU += val
+				}
+			}
+
 			cpuAdder := int64(float64(fakeNodeInfo.Requested.MilliCPU) * requestsMultiplier)
 			if cpuAdder < 100 {
 				// if the pod is claiming very low CPU requests, reserve a reasonable amount
@@ -216,7 +232,7 @@ func (gravity *Gravity) Filter(ctx context.Context, cycleState *framework.CycleS
 	// Unfortunately, if there is only one node, other lifecycle methods like Score() and NormalizeScore()
 	// will not be called. So Filter() has to assume that there may only be one node and that Filter() is the final
 	// decider. Thus, add the pod Adder now for all nodes and then remove it from unselected nodes
-	// once IF Score() is called.
+	// once, IF Score() is called.
 	cpuAdder, memoryAdder := gravity.getPodAdder(pod)
 	gravity.freshMetricsMap.AddAdder(nodeName, cpuAdder, memoryAdder)
 	klog.V(6).InfoS("Filter() WILL consider node", "nodeName", nodeName, "pod", podName, "cpuAdder", cpuAdder, "memoryAdder", memoryAdder)
@@ -319,7 +335,7 @@ func (gravity *Gravity) doesPodFitNode(ctx context.Context, pod *v1.Pod, nodeInf
 		} else if newCPURequestsPercent > 94 {
 			klog.V(6).InfoS("Node will NOT be prioritized because combined CPU requests would be too high", "nodeName", nodeName, "newCPURequests%", newCPURequestsPercent)
 		} else if newMemoryRequestsPercent > 94 {
-			klog.V(6).InfoS("Node will NOT be prioritized because combined Memory requests would be too high", "nodeName", nodeName, "newMemoryRequests%", newMemoryRequestsPercent)
+			klog.V(6).InfoS("Node will NOT be prioritized because combined M]memory requests would be too high", "nodeName", nodeName, "newMemoryRequests%", newMemoryRequestsPercent)
 		} else if predictedMemoryUsage > hostMaximumMemoryUtilization {
 			klog.V(6).InfoS("Node will NOT be prioritized because predicted memory utilization would be too high", "nodeName", nodeName, "predictedMemory%", predictedMemoryUsage)
 		} else if !bigPodFit && predictedCPUUsage > hostTargetUtilizationPercent {
