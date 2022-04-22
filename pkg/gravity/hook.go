@@ -37,19 +37,19 @@ func (gravity *Gravity) initWebhook(ctx context.Context) {
 	config := gravity.config
 
 	hookServer := &webhook.Server{
-		Port: config.WebHook.Port,
+		Port: int(config.Webhook.Port),
 	}
 
-	if len(config.WebHook.CertDir) == 0 {
-		hookServer.CertDir = config.WebHook.CertDir
+	if len(config.Webhook.CertDir) == 0 {
+		hookServer.CertDir = config.Webhook.CertDir
 	}
 
-	if len(config.WebHook.KeyName) == 0 {
-		hookServer.KeyName = config.WebHook.KeyName
+	if len(config.Webhook.KeyName) == 0 {
+		hookServer.KeyName = config.Webhook.KeyName
 	}
 
-	if len(config.WebHook.CertName) == 0 {
-		hookServer.CertName = config.WebHook.CertName
+	if len(config.Webhook.CertName) == 0 {
+		hookServer.CertName = config.Webhook.CertName
 	}
 
 	if err := mgr.Add(hookServer); err != nil {

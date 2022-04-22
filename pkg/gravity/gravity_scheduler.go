@@ -12,6 +12,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//LOOK AT DEFAULTS FOR API TYPES!!
+
 package gravity
 
 import (

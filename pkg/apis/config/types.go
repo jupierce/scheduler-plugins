@@ -158,15 +158,15 @@ type GravityArgs struct {
 	// Maximum memory utilization
 	MaximumMemoryUtilization int64
 
-	MaximumPodsPerNode int
+	MaximumPodsPerNode int64
 
-	WebHook GravityWebhookConfig
+	Webhook GravityWebhookConfig
 }
 
 type GravityWebhookConfig struct {
 	// Port is the port number that the server will serve.
 	// It will be defaulted to 9443 if unspecified.
-	Port int
+	Port int64
 
 	// CertDir is the directory that contains the server key and certificate. The
 	// server key and certificate.

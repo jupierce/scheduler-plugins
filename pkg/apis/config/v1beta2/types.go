@@ -137,22 +137,34 @@ type GravityArgs struct {
 	// Node target CPU Utilization for bin packing
 	TargetUtilization *int64 `json:"targetUtilization,omitempty"`
 
+	AdderTTL *int64 `json:"adderTTL,omitempty"`
+
 	// Set >1 if workloads are underreporting their CPU utilization
 	DefaultCPURequestMultiplier *string `json:"defaultCPURequestMultiplier,omitempty"`
 
 	// Maximum memory utilization
 	MaximumMemoryUtilization *int64 `json:"maximumMemoryUtilization,omitempty"`
 
-	MaximumPodsPerNode *int `json:"maximumPodsPerNode,omitempty"`
+	MaximumPodsPerNode *int64 `json:"maximumPodsPerNode,omitempty"`
 
 	// Webhook configuration to provide more features
-	Webhook *GravityWebhookConfig `json:"webhook,omitempty"`
+	Webhook GravityWebhookConfig `json:"webhook,omitempty"`
 }
 
 type GravityWebhookConfig struct {
-	Port     int
-	KeyPath  string
-	CertPath string
+	// Port is the port number that the server will serve.
+	// It will be defaulted to 9443 if unspecified.
+	Port *int64 `json:"port,omitempty"`
+
+	// CertDir is the directory that contains the server key and certificate. The
+	// server key and certificate.
+	CertDir *string `json:"certDir,omitempty"`
+
+	// CertName is the server certificate name. Defaults to tls.crt.
+	CertName *string `json:"certName,omitempty"`
+
+	// KeyName is the server key name. Defaults to tls.key.
+	KeyName *string `json:"keyName,omitempty"`
 }
 
 // ScoringStrategyType is a "string" type.
