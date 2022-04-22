@@ -11,25 +11,24 @@ require (
 	github.com/spf13/pflag v1.0.5
 	github.com/stretchr/testify v1.7.0
 	gonum.org/v1/gonum v0.6.2
-	k8s.io/api v0.23.5
-	k8s.io/apiextensions-apiserver v0.23.5
-	k8s.io/apimachinery v0.23.5
+	k8s.io/api v0.22.6
+	k8s.io/apiextensions-apiserver v0.22.2
+	k8s.io/apimachinery v0.22.6
 	k8s.io/apiserver v0.22.6
-	k8s.io/client-go v0.23.5
+	k8s.io/client-go v0.22.6
 	k8s.io/code-generator v0.22.6
-	k8s.io/component-base v0.23.5
+	k8s.io/component-base v0.22.6
 	k8s.io/component-helpers v0.22.6
 	k8s.io/klog/hack/tools v0.0.0-20210917071902-331d2323a192
-	k8s.io/klog/v2 v2.30.0
+	k8s.io/klog/v2 v2.9.0
 	k8s.io/kube-aggregator v0.0.0
-	k8s.io/kube-openapi v0.0.0-20211115234752-e816edb12b65
+	k8s.io/kube-openapi v0.0.0-20211109043538-20434351676c
 	k8s.io/kube-scheduler v0.22.6
 	k8s.io/kubernetes v1.22.6
 	k8s.io/metrics v0.22.6
-	k8s.io/utils v0.0.0-20211116205334-6203023598ed
-	sigs.k8s.io/controller-runtime v0.11.2
-	sigs.k8s.io/yaml v1.3.0
-
+	k8s.io/utils v0.0.0-20210819203725-bdf08cb9a70a
+	sigs.k8s.io/controller-runtime v0.10.2
+	sigs.k8s.io/yaml v1.2.0
 )
 
 replace (
