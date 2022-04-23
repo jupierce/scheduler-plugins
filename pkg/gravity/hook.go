@@ -34,7 +34,7 @@ func (gravity *Gravity) initWebhook(ctx context.Context) {
 	if err != nil {
 		panic(err)
 	}
-	config := gravity.config
+	config := gravity.pluginConfig
 
 	hookServer := &webhook.Server{
 		Port: int(config.Webhook.Port),
@@ -65,6 +65,10 @@ func (gravity *Gravity) initWebhook(ctx context.Context) {
 }
 
 func (gravity *Gravity) shouldAugment(pod *corev1.Pod) bool {
+	if !gravity.pluginConfig.CPUOvercommitEnabled {
+		klog.Info("CPUOvercommitEnabled is not enabled; webhook will not make changes to Pod")
+		return false
+	}
 	if pod.Annotations != nil {
 		if v, ok := pod.Annotations[OvercommitCPURequestsAnnotationName]; ok {
 			if b, err := strconv.ParseBool(v); err == nil && b {

@@ -153,12 +153,15 @@ type GravityArgs struct {
 	AdderTTL int64
 
 	// Set >1 if workloads are underreporting their CPU utilization
-	DefaultCPURequestMultiplier string
+	CPURequestMultiplier float64
 
 	// Maximum memory utilization
 	MaximumMemoryUtilization int64
 
 	MaximumPodsPerNode int64
+
+	// If the webhook should modify pods to support Gravity's CPU overcommit functionality
+	CPUOvercommitEnabled bool
 
 	Webhook GravityWebhookConfig
 }
@@ -177,6 +180,7 @@ type GravityWebhookConfig struct {
 
 	// KeyName is the server key name. Defaults to tls.key.
 	KeyName string
+
 }
 
 // ScoringStrategyType is a "string" type.

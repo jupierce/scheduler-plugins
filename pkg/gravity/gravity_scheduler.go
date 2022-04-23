@@ -12,8 +12,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//LOOK AT DEFAULTS FOR API TYPES!!
-
 package gravity
 
 import (
@@ -43,7 +41,6 @@ import (
 	metricsv "k8s.io/metrics/pkg/client/clientset/versioned"
 
 	pluginConfig "sigs.k8s.io/scheduler-plugins/pkg/apis/config"
-	"sigs.k8s.io/scheduler-plugins/pkg/apis/config/v1beta2"
 )
 
 const (
@@ -63,10 +60,11 @@ const (
 )
 
 var (
-	hostTargetUtilizationPercent = v1beta2.DefaultTargetUtilizationPercent
-	hostMaximumMemoryUtilization = int64(60)
-	requestsMultiplier           = float64(1)
-	maximumPodsPerNode           = 130
+	DefaultTargetUtilizationPercent = int64(60)
+	DefaultMaximumMemoryUtilization = int64(60)
+	DefaultAdderTTL = int64(120)
+	DefaultRequestsMultiplier = float64(1)
+	DefaultMaximumPodsPerNode = int64(130)
 	SchedulerTaint               = v1.Taint{
 		Key:    SchedulerTaintName,
 		Effect: v1.TaintEffectNoSchedule,
@@ -81,8 +79,8 @@ type Gravity struct {
 	metricsClient   metricsv.Interface
 	k8sClient       clientset.Interface
 	freshMetricsMap *FreshMetricsMap
-	decoder         *admission.Decoder
-	config          *pluginConfig.GravityArgs
+	decoder      *admission.Decoder
+	pluginConfig *pluginConfig.GravityArgs
 }
 
 func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) {
@@ -107,12 +105,10 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 		return nil, err
 	}
 
-	args, err := getArgs(obj)
+	args, err := getSchedulerPluginConfig(obj)
 	if err != nil {
 		return nil, err
 	}
-	hostTargetUtilizationPercent = args.TargetUtilization
-	requestsMultiplier, _ = strconv.ParseFloat(args.DefaultCPURequestMultiplier, 64)
 
 	if len(args.InstanceName) > 0 {
 		SchedulerTaint.Value = args.InstanceName
@@ -123,6 +119,11 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 		k8sClient:       handle.ClientSet(),
 		metricsClient:   metricsClient,
 		freshMetricsMap: NewFreshMetricsMap(0, 220, 60),
+		pluginConfig:    args,
+	}
+
+	if gravity.pluginConfig.Webhook.Port != 0 {
+		gravity.initWebhook(context.TODO())
 	}
 
 	gravity.startTime = time.Now().Unix()
@@ -141,7 +142,6 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 
 	go func() {
 		ctx := context.TODO()
-		hostTargetUtilizationPercent = args.TargetUtilization
 		removeTaintCheck := time.NewTicker(time.Minute * 1)
 		for range removeTaintCheck.C {
 
@@ -163,12 +163,12 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 
 			for _, node := range taintedNodes {
 				nodeName := node.Name
-				untaintTarget := int(float64(hostTargetUtilizationPercent) * 0.8)
+				untaintTarget := int(float64(gravity.pluginConfig.TargetUtilization) * 0.8)
 				cpuUtilPercent, memoryUtilPercent, err := gravity.fetchNodeMetricPercentages(ctx, node, 30)
 				if err == nil {
 					klog.V(6).InfoS("During tainting check node utilization", "nodeName", nodeName, "cpu", cpuUtilPercent, "memory", memoryUtilPercent, "cpuTarget%", untaintTarget)
 					if cpuUtilPercent < untaintTarget {
-						gravity.setNodeTaint(ctx, node.Name, false)
+						_ = gravity.setNodeTaint(ctx, node.Name, false)
 					}
 				} else {
 					klog.Errorf("Unable to retrieve node %v metrics for tainting check: %v", nodeName, err)
@@ -199,7 +199,7 @@ func (gravity *Gravity) getPodAdder(pod *v1.Pod) (int64, int64) {
 				}
 			}
 
-			cpuAdder := int64(float64(fakeNodeInfo.Requested.MilliCPU) * requestsMultiplier)
+			cpuAdder := int64(float64(fakeNodeInfo.Requested.MilliCPU) * gravity.pluginConfig.CPURequestMultiplier)
 			if cpuAdder < 100 {
 				// if the pod is claiming very low CPU requests, reserve a reasonable amount
 				// until it shows us what it really needs.
@@ -212,7 +212,7 @@ func (gravity *Gravity) getPodAdder(pod *v1.Pod) (int64, int64) {
 	return 0, 0
 }
 
-func (gravity *Gravity) Filter(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+func (gravity *Gravity) Filter(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
 	nodeName := nodeInfo.Node().Name
 	podName := pod.Namespace + "/" + pod.Name
 	// It is important to note here that Score() is not called if there is only one feasible node.
@@ -227,7 +227,7 @@ func (gravity *Gravity) Filter(ctx context.Context, cycleState *framework.CycleS
 
 	if !fits {
 		klog.V(6).InfoS("Filter() will NOT consider node with utilization", "nodeName", nodeName, "pod", podName)
-		gravity.setNodeTaint(ctx, nodeName, true)
+		_ = gravity.setNodeTaint(ctx, nodeName, true)
 		return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("Node %v is heavily utilized", nodeName))
 	}
 
@@ -245,19 +245,43 @@ func (gravity *Gravity) Name() string {
 	return Name
 }
 
-func getArgs(obj runtime.Object) (*pluginConfig.GravityArgs, error) {
-	/*args, ok := obj.(*pluginConfig.GravityArgs)
+func getSchedulerPluginConfig(obj runtime.Object) (*pluginConfig.GravityArgs, error) {
+	args, ok := obj.(*pluginConfig.GravityArgs)
 	if !ok {
 		return nil, fmt.Errorf("args must be of type GravityArgs, got %T", obj)
 	}
-	*/
-	/*
-		_, err := strconv.ParseFloat(args.DefaultRequestsMultiplier, 64)
-		if err != nil {
-			return nil, errors.New("unable to parse DefaultRequestsMultiplier: " + err.Error())
+
+	if args.TargetUtilization == 0 {
+		args.TargetUtilization = DefaultTargetUtilizationPercent
+	}
+
+	if args.MaximumMemoryUtilization == 0 {
+		args.MaximumMemoryUtilization = DefaultMaximumMemoryUtilization
+	}
+
+	if args.AdderTTL == 0 {
+		args.AdderTTL = DefaultAdderTTL
+	}
+
+	if args.CPURequestMultiplier < DefaultRequestsMultiplier {
+		// The multiplier cannot be less than one. Otherwise, the requests
+		// identified by the kubelet will hit the allocatable CPU of the
+		// node before the scheduler would. To overcommit CPU, use
+		// CPUOvercommitEnabled
+		args.CPURequestMultiplier = DefaultRequestsMultiplier
+	}
+
+	if args.CPUOvercommitEnabled  {
+		if args.Webhook.Port == 0 {
+			return nil, fmt.Errorf("webhook configuration must be provided to use CPUOvercommitEnabled")
 		}
-		return args, nil */
-	return nil, nil
+	}
+
+	if args.MaximumPodsPerNode == 0 {
+		args.MaximumPodsPerNode = DefaultMaximumPodsPerNode
+	}
+
+	return args, nil
 }
 
 func (gravity *Gravity) doesPodFitNode(ctx context.Context, pod *v1.Pod, nodeInfo *framework.NodeInfo, noOlderThan int64) (bool, error) {
@@ -283,8 +307,8 @@ func (gravity *Gravity) doesPodFitNode(ctx context.Context, pod *v1.Pod, nodeInf
 		return false, err
 	}
 
-	testCPUMillis := int64(float64(incomingRequestCPUMillis) * requestsMultiplier)
-	maxMillis := hostTargetUtilizationPercent * nodeAllocatableCPUMillis / 100
+	testCPUMillis := int64(float64(incomingRequestCPUMillis) * gravity.pluginConfig.CPURequestMultiplier)
+	maxMillis := gravity.pluginConfig.TargetUtilization * nodeAllocatableCPUMillis / 100
 	if testCPUMillis > maxMillis {
 		// our request can't be larger than the node allocatable or
 		// we continue to scale the cluster and never be able to seat the pod.
@@ -307,13 +331,13 @@ func (gravity *Gravity) doesPodFitNode(ctx context.Context, pod *v1.Pod, nodeInf
 		"podName", incomingPodName,
 	)
 
-	scheduledRequestedCPUMillis := int64(float64(nodeInfo.Requested.MilliCPU) * requestsMultiplier)
+	scheduledRequestedCPUMillis := int64(float64(nodeInfo.Requested.MilliCPU) * gravity.pluginConfig.CPURequestMultiplier)
 	scheduledRequestedMemory := nodeInfo.Requested.Memory
 	podCount := len(nodeInfo.Pods)
 
 	klog.V(6).InfoS("Existing requests for node",
 		"nodeName", nodeName,
-		"requestsMultiplier", requestsMultiplier,
+		"cpuRequestsMultiplier", gravity.pluginConfig.CPURequestMultiplier,
 		"scheduledRequestedCPUMillis", scheduledRequestedCPUMillis,
 		"scheduledRequestedMemory", scheduledRequestedMemory,
 		"podCount", podCount,
@@ -328,19 +352,19 @@ func (gravity *Gravity) doesPodFitNode(ctx context.Context, pod *v1.Pod, nodeInf
 		newCPURequestsPercent := 100 * (scheduledRequestedCPUMillis + incomingRequestCPUMillis) / nodeAllocatableCPUMillis
 		newMemoryRequestsPercent := 100 * (scheduledRequestedMemory + incomingRequestMemory) / nodeAllocatableMemory
 		bigPodFit := false
-		if ((100*incomingRequestPercent)/hostTargetUtilizationPercent > 80) && predictedCPUUsage < 100 {
+		if ((100*incomingRequestPercent)/gravity.pluginConfig.TargetUtilization > 80) && predictedCPUUsage < 100 {
 			bigPodFit = true
 			klog.V(6).InfoS("Running bigpod logic for", "nodeName", nodeName, "podName%", incomingPodName)
 		}
-		if podCount > maximumPodsPerNode {
+		if int64(podCount) > gravity.pluginConfig.MaximumPodsPerNode {
 			klog.V(6).InfoS("Node will NOT be prioritized because pod count is high", "nodeName", nodeName, "podCount", podCount)
 		} else if newCPURequestsPercent > 94 {
 			klog.V(6).InfoS("Node will NOT be prioritized because combined CPU requests would be too high", "nodeName", nodeName, "newCPURequests%", newCPURequestsPercent)
 		} else if newMemoryRequestsPercent > 94 {
 			klog.V(6).InfoS("Node will NOT be prioritized because combined M]memory requests would be too high", "nodeName", nodeName, "newMemoryRequests%", newMemoryRequestsPercent)
-		} else if predictedMemoryUsage > hostMaximumMemoryUtilization {
+		} else if predictedMemoryUsage > gravity.pluginConfig.MaximumMemoryUtilization {
 			klog.V(6).InfoS("Node will NOT be prioritized because predicted memory utilization would be too high", "nodeName", nodeName, "predictedMemory%", predictedMemoryUsage)
-		} else if !bigPodFit && predictedCPUUsage > hostTargetUtilizationPercent {
+		} else if !bigPodFit && predictedCPUUsage > gravity.pluginConfig.TargetUtilization {
 			klog.V(6).InfoS("Node will NOT be prioritized because predicted CPU utilization would be too high", "nodeName", nodeName, "predictedCPU%", predictedCPUUsage)
 		} else {
 			klog.V(6).InfoS("Node WILL be prioritized because scheduled resources and measured CPU utilization are within targets",
@@ -355,7 +379,7 @@ func (gravity *Gravity) doesPodFitNode(ctx context.Context, pod *v1.Pod, nodeInf
 	}
 	return fits, nil
 }
-func (gravity *Gravity) Score(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
+func (gravity *Gravity) Score(_ context.Context, _ *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
 	// Filter() should have done all the calculations necessary to eliminate nodes
 	// this pod will NOT fit. So everything remaining gets max score.
 	var score = framework.MaxNodeScore
@@ -484,7 +508,7 @@ func (gravity *Gravity) fetchNodeMetricPercentages(ctx context.Context, node *v1
 	return nodeCPUPercentUsed, nodeMemoryPercentUsed, nil
 }
 
-func (gravity *Gravity) NormalizeScore(ctx context.Context, state *framework.CycleState, pod *v1.Pod, scores framework.NodeScoreList) *framework.Status {
+func (gravity *Gravity) NormalizeScore(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, scores framework.NodeScoreList) *framework.Status {
 	podName := pod.Namespace + "/" + pod.Name
 	scoresCopy := make(framework.NodeScoreList, len(scores))
 	copy(scoresCopy, scores)
@@ -526,7 +550,7 @@ func (gravity *Gravity) NormalizeScore(ctx context.Context, state *framework.Cyc
 					klog.Errorf("Final node utilization check failed for pod %v on %v; will not assign: %v", podName, nodeScore.Name, err)
 					scoresMap[nodeScore.Name].Score = framework.MinNodeScore
 				} else if !targetNodeFound {
-					gravity.setNodeTaint(ctx, nodeScore.Name, true)
+					_ = gravity.setNodeTaint(ctx, nodeScore.Name, true)
 					scoresMap[nodeScore.Name].Score = framework.MinNodeScore
 				}
 			} else {

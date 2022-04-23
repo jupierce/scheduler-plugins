@@ -181,13 +181,16 @@ func autoConvert_v1beta2_GravityArgs_To_config_GravityArgs(in *GravityArgs, out 
 	if err := v1.Convert_Pointer_int64_To_int64(&in.AdderTTL, &out.AdderTTL, s); err != nil {
 		return err
 	}
-	if err := v1.Convert_Pointer_string_To_string(&in.DefaultCPURequestMultiplier, &out.DefaultCPURequestMultiplier, s); err != nil {
+	if err := v1.Convert_Pointer_float64_To_float64(&in.CPURequestMultiplier, &out.CPURequestMultiplier, s); err != nil {
 		return err
 	}
 	if err := v1.Convert_Pointer_int64_To_int64(&in.MaximumMemoryUtilization, &out.MaximumMemoryUtilization, s); err != nil {
 		return err
 	}
 	if err := v1.Convert_Pointer_int64_To_int64(&in.MaximumPodsPerNode, &out.MaximumPodsPerNode, s); err != nil {
+		return err
+	}
+	if err := v1.Convert_Pointer_bool_To_bool(&in.CPUOvercommitEnabled, &out.CPUOvercommitEnabled, s); err != nil {
 		return err
 	}
 	if err := Convert_v1beta2_GravityWebhookConfig_To_config_GravityWebhookConfig(&in.Webhook, &out.Webhook, s); err != nil {
@@ -211,13 +214,16 @@ func autoConvert_config_GravityArgs_To_v1beta2_GravityArgs(in *config.GravityArg
 	if err := v1.Convert_int64_To_Pointer_int64(&in.AdderTTL, &out.AdderTTL, s); err != nil {
 		return err
 	}
-	if err := v1.Convert_string_To_Pointer_string(&in.DefaultCPURequestMultiplier, &out.DefaultCPURequestMultiplier, s); err != nil {
+	if err := v1.Convert_float64_To_Pointer_float64(&in.CPURequestMultiplier, &out.CPURequestMultiplier, s); err != nil {
 		return err
 	}
 	if err := v1.Convert_int64_To_Pointer_int64(&in.MaximumMemoryUtilization, &out.MaximumMemoryUtilization, s); err != nil {
 		return err
 	}
 	if err := v1.Convert_int64_To_Pointer_int64(&in.MaximumPodsPerNode, &out.MaximumPodsPerNode, s); err != nil {
+		return err
+	}
+	if err := v1.Convert_bool_To_Pointer_bool(&in.CPUOvercommitEnabled, &out.CPUOvercommitEnabled, s); err != nil {
 		return err
 	}
 	if err := Convert_config_GravityWebhookConfig_To_v1beta2_GravityWebhookConfig(&in.Webhook, &out.Webhook, s); err != nil {

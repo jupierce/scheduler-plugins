@@ -120,9 +120,9 @@ func (in *GravityArgs) DeepCopyInto(out *GravityArgs) {
 		*out = new(int64)
 		**out = **in
 	}
-	if in.DefaultCPURequestMultiplier != nil {
-		in, out := &in.DefaultCPURequestMultiplier, &out.DefaultCPURequestMultiplier
-		*out = new(string)
+	if in.CPURequestMultiplier != nil {
+		in, out := &in.CPURequestMultiplier, &out.CPURequestMultiplier
+		*out = new(float64)
 		**out = **in
 	}
 	if in.MaximumMemoryUtilization != nil {
@@ -133,6 +133,11 @@ func (in *GravityArgs) DeepCopyInto(out *GravityArgs) {
 	if in.MaximumPodsPerNode != nil {
 		in, out := &in.MaximumPodsPerNode, &out.MaximumPodsPerNode
 		*out = new(int64)
+		**out = **in
+	}
+	if in.CPUOvercommitEnabled != nil {
+		in, out := &in.CPUOvercommitEnabled, &out.CPUOvercommitEnabled
+		*out = new(bool)
 		**out = **in
 	}
 	in.Webhook.DeepCopyInto(&out.Webhook)

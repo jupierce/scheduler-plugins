@@ -153,12 +153,15 @@ type GravityArgs struct {
 	AdderTTL *int64 `json:"adderTTL,omitempty"`
 
 	// Set >1 if workloads are underreporting their CPU utilization
-	DefaultCPURequestMultiplier *string `json:"defaultCPURequestMultiplier,omitempty"`
+	CPURequestMultiplier *float64 `json:"cpuRequestMultiplier,omitempty"`
 
 	// Maximum memory utilization
 	MaximumMemoryUtilization *int64 `json:"maximumMemoryUtilization,omitempty"`
 
 	MaximumPodsPerNode *int64 `json:"maximumPodsPerNode,omitempty"`
+
+	// If the webhook should modify pods to support Gravity's CPU overcommit functionality
+	CPUOvercommitEnabled *bool `json:"cpuOvercommitEnabled,omitempty"`
 
 	Webhook GravityWebhookConfig `json:"webhook,omitempty"`
 }
@@ -177,6 +180,7 @@ type GravityWebhookConfig struct {
 
 	// KeyName is the server key name. Defaults to tls.key.
 	KeyName *string `json:"keyName,omitempty"`
+
 }
 
 // ScoringStrategyType is a "string" type.
