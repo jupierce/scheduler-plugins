@@ -57,13 +57,17 @@ const (
 	// OvercommitCPUHintAnnotationName Used by the webhook to squirrel away the original CPU requested by the pod.
 	// This will be used as the adder for the Pod.
 	OvercommitCPUHintAnnotationName = "gravity-scheduler.openshift.io/original-cpu-requests"
+
+	// TapOutCPUPercent is a level of CPU utilization the scheduler considers extreme for edge case
+	// decision-making purposes.
+	TapOutCPUPercent = 94
+	TapOutMemoryPercent = 90
 )
 
 var (
 	DefaultTargetUtilizationPercent = int64(60)
 	DefaultMaximumMemoryUtilization = int64(60)
 	DefaultAdderTTL = int64(120)
-	DefaultRequestsMultiplier = float64(1)
 	DefaultMaximumPodsPerNode = int64(130)
 	SchedulerTaint               = v1.Taint{
 		Key:    SchedulerTaintName,
@@ -108,10 +112,6 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 	args, err := getSchedulerPluginConfig(obj)
 	if err != nil {
 		return nil, err
-	}
-
-	if len(args.InstanceName) > 0 {
-		SchedulerTaint.Value = args.InstanceName
 	}
 
 	gravity := &Gravity{
@@ -198,13 +198,11 @@ func (gravity *Gravity) getPodAdder(pod *v1.Pod) (int64, int64) {
 					fakeNodeInfo.Requested.MilliCPU += val
 				}
 			}
-
-			cpuAdder := int64(float64(fakeNodeInfo.Requested.MilliCPU) * gravity.pluginConfig.CPURequestMultiplier)
-			if cpuAdder < 100 {
-				// if the pod is claiming very low CPU requests, reserve a reasonable amount
-				// until it shows us what it really needs.
-				cpuAdder = 500
-			}
+			// Even if this Pod is not using overcommit mode, we still establish a temporary adder
+			// based on requested CPU & memory. This helps give Pods to spin up and use the resources
+			// the claimed to before measurements. Ultimately, measuring pods that have spun up
+			// will help us get a better metric to assess whether we are > target utilization.
+			cpuAdder := fakeNodeInfo.NonZeroRequested.MilliCPU
 			memoryAdder := fakeNodeInfo.NonZeroRequested.Memory
 			return cpuAdder, memoryAdder
 		}
@@ -263,14 +261,6 @@ func getSchedulerPluginConfig(obj runtime.Object) (*pluginConfig.GravityArgs, er
 		args.AdderTTL = DefaultAdderTTL
 	}
 
-	if args.CPURequestMultiplier < DefaultRequestsMultiplier {
-		// The multiplier cannot be less than one. Otherwise, the requests
-		// identified by the kubelet will hit the allocatable CPU of the
-		// node before the scheduler would. To overcommit CPU, use
-		// CPUOvercommitEnabled
-		args.CPURequestMultiplier = DefaultRequestsMultiplier
-	}
-
 	if args.CPUOvercommitEnabled  {
 		if args.Webhook.Port == 0 {
 			return nil, fmt.Errorf("webhook configuration must be provided to use CPUOvercommitEnabled")
@@ -285,99 +275,190 @@ func getSchedulerPluginConfig(obj runtime.Object) (*pluginConfig.GravityArgs, er
 }
 
 func (gravity *Gravity) doesPodFitNode(ctx context.Context, pod *v1.Pod, nodeInfo *framework.NodeInfo, noOlderThan int64) (bool, error) {
+
+	// The default utilizations come from the scheduler's plugin config, but they can be overridden by labels.
+	targetCPUUtilization := gravity.pluginConfig.TargetUtilization
+	maximumMemoryUtilization := gravity.pluginConfig.MaximumMemoryUtilization
+
 	incomingPodName := pod.ObjectMeta.Namespace + "/" + pod.Name
 	nodeName := nodeInfo.Node().Name
 
-	nodeCPUMillisUsed, nodeMemoryUsed, err := gravity.fetchNodeMetrics(ctx, nodeName, noOlderThan)
+	// Calculates node use if this pod landed on the node.
+	predictedNodeInfo := framework.NewNodeInfo()
+	// Approximates the load of an "empty" node by summing requirements of all daemonset pods
+	nodeOverheadInfo := framework.NewNodeInfo()
+
+	for _, podInfo := range nodeInfo.Pods {
+		predictedNodeInfo.AddPod(podInfo.Pod)
+		ownerReferences := podInfo.Pod.OwnerReferences
+		if ownerReferences != nil {
+			for i := range ownerReferences {
+				reference := &ownerReferences[i]
+				if reference.Kind == "DaemonSet" {
+					nodeOverheadInfo.AddPod(podInfo.Pod)
+				}
+			}
+		}
+	}
+
+	predictedNodeInfo.AddPod(pod) // finally, add the incoming pod to predicted node
+
+	percentage := func(numerator int64, denominator int64) int64 {
+		return (100 * numerator) / denominator
+	}
+
+	// On this node, how much is technically allocatable
+	allocatableNodeCPUMillis := nodeInfo.Allocatable.MilliCPU
+	allocatableNodeMemory := nodeInfo.Allocatable.MilliCPU
+
+	// How much resource would a "fresh" node of this same type potentially provide
+	usableTheoryNodeCPUMillis := allocatableNodeCPUMillis - nodeOverheadInfo.NonZeroRequested.MilliCPU
+	usableTheoryNodeMemory := allocatableNodeMemory - nodeOverheadInfo.NonZeroRequested.Memory
+
+	klog.V(6).InfoS("Calculated allocatable and theoretically usable resources for node",
+		"nodeName", nodeName,
+		"allocatableNodeCPUMillis", allocatableNodeCPUMillis,
+		"allocatableNodeMemory", allocatableNodeMemory,
+		"usableTheoryNodeCPUMillis", usableTheoryNodeCPUMillis,
+		"usableTheoryNodeCPUMillis", usableTheoryNodeCPUMillis,
+	)
+
+	if usableTheoryNodeCPUMillis <= 0 || usableTheoryNodeMemory <= 0 {
+		// Don't taint. Just let normal resource utilization scheduling take over.
+		return false, fmt.Errorf("%v scheduler is unable to assess usable targets for node %v CPU and memory; deferring to normal schedulers", Name, nodeName)
+	}
+
+	// Construct a fake node to calculate the requests for the incoming pod
+	fakeNodeInfo := framework.NewNodeInfo(pod)
+	incomingPodRequestCPUMillis := fakeNodeInfo.NonZeroRequested.MilliCPU
+	incomingPodRequestMemory := fakeNodeInfo.NonZeroRequested.Memory
+
+	// Check for and defer scheduling of uncomfortably large pods relative to node allocatable
+	if percentage(incomingPodRequestCPUMillis, usableTheoryNodeCPUMillis) > TapOutCPUPercent {
+		klog.Warningf("Evaluated %v and pod %v CPU request %v greater too close to estimated usable CPU %v for nodes of this type; deferring to normal schedulers", nodeName, incomingPodName, incomingPodRequestCPUMillis, usableTheoryNodeCPUMillis)
+		// Don't taint. Just let normal resource utilization scheduling take over.
+		return false, fmt.Errorf("%v scheduler cannot help assign a pod using significant CPU relative to node size", Name)
+	}
+	if percentage(incomingPodRequestMemory, usableTheoryNodeMemory) > TapOutMemoryPercent {
+		klog.Warningf("Evaluated %v and pod %v CPU request %v greater too close to estimated usable CPU %v for nodes of this type; deferring to normal schedulers", nodeName, incomingPodName, incomingPodRequestCPUMillis, usableTheoryNodeCPUMillis)
+		// Don't taint. Just let normal resource utilization scheduling take over.
+		return false, fmt.Errorf("%v scheduler cannot help assign a pod using significant memory relative to node size", Name)
+	}
+
+	nodeCPUMillisUseMetric, nodeMemoryUseMetric, err := gravity.fetchNodeMetrics(ctx, nodeName, noOlderThan)
 	if err != nil {
 		klog.ErrorS(nil, "CPU & memory metric not found for node", "nodeName")
 		_ = gravity.setNodeTaint(ctx, nodeName, true)
-		return false, err
-	}
-	nodeAllocatableCPUMillis := nodeInfo.Allocatable.MilliCPU
-	nodeAllocatableMemory := nodeInfo.Allocatable.Memory
-
-	// Construct a fake node to calculate requests
-	fakeNodeInfo := framework.NewNodeInfo(pod)
-	incomingRequestCPUMillis := fakeNodeInfo.Requested.MilliCPU
-
-	if incomingRequestCPUMillis > nodeAllocatableCPUMillis {
-		klog.ErrorS(nil, "Pod requests greater than all allocatable CPU", "nodeName", "podRequest", incomingRequestCPUMillis, "allocatable", nodeAllocatableCPUMillis)
-		// Don't taint. Just let normal resource utilization filtering take over.
-		return false, err
+		return false, fmt.Errorf("unable to retrieve node metrcs: %v", err)
 	}
 
-	testCPUMillis := int64(float64(incomingRequestCPUMillis) * gravity.pluginConfig.CPURequestMultiplier)
-	maxMillis := gravity.pluginConfig.TargetUtilization * nodeAllocatableCPUMillis / 100
-	if testCPUMillis > maxMillis {
-		// our request can't be larger than the node allocatable or
-		// we continue to scale the cluster and never be able to seat the pod.
-		incomingRequestCPUMillis = maxMillis
-	} else {
-		incomingRequestCPUMillis = testCPUMillis
-	}
+	inUseCPUPercent := percentage(nodeCPUMillisUseMetric, nodeInfo.Allocatable.MilliCPU)
+	inUseMemoryPercent := percentage(nodeMemoryUseMetric, nodeInfo.Allocatable.Memory)
 
-	incomingRequestMemory := fakeNodeInfo.Requested.Memory // bytes
-
-	klog.V(6).InfoS("Requests for incoming pod", "podName", incomingPodName, "millis", incomingRequestCPUMillis)
-
-	inUseCPUPercent := int((100 * nodeCPUMillisUsed) / nodeAllocatableCPUMillis)
-	inUseMemoryPercent := int((100 * nodeMemoryUsed) / nodeAllocatableMemory)
-
-	klog.V(6).InfoS("Measured current node utilization on node for incoming pod",
+	klog.V(6).InfoS("Measured current node utilization for incoming pod",
 		"nodeName", nodeName,
+		"podName", incomingPodName,
 		"inUseCPU%", inUseCPUPercent,
 		"inUseMemory%", inUseMemoryPercent,
-		"podName", incomingPodName,
 	)
 
-	scheduledRequestedCPUMillis := int64(float64(nodeInfo.Requested.MilliCPU) * gravity.pluginConfig.CPURequestMultiplier)
-	scheduledRequestedMemory := nodeInfo.Requested.Memory
+	alreadyRequestedCPUMillis := nodeInfo.NonZeroRequested.MilliCPU
+	alreadyRequestedMemory := nodeInfo.Requested.Memory
 	podCount := len(nodeInfo.Pods)
 
 	klog.V(6).InfoS("Existing requests for node",
 		"nodeName", nodeName,
-		"cpuRequestsMultiplier", gravity.pluginConfig.CPURequestMultiplier,
-		"scheduledRequestedCPUMillis", scheduledRequestedCPUMillis,
-		"scheduledRequestedMemory", scheduledRequestedMemory,
+		"podName", incomingPodName,
+		"alreadyRequestedCPUMillis", alreadyRequestedCPUMillis,
+		"alreadyRequestedMemory", alreadyRequestedMemory,
 		"podCount", podCount,
 	)
-	fits := false
-	if nodeAllocatableCPUMillis != 0 && nodeAllocatableMemory != 0 {
-		incomingRequestPercent := (100 * incomingRequestCPUMillis) / nodeAllocatableCPUMillis
-		// Based on measured utilization on the system, what might the CPU & memory become if we schedule this pod
-		predictedCPUUsage := 100 * (nodeCPUMillisUsed + incomingRequestCPUMillis) / nodeAllocatableCPUMillis
-		predictedMemoryUsage := 100 * (nodeMemoryUsed + incomingRequestMemory) / nodeAllocatableMemory
-		// Based on total requests, what would the new requests be
-		newCPURequestsPercent := 100 * (scheduledRequestedCPUMillis + incomingRequestCPUMillis) / nodeAllocatableCPUMillis
-		newMemoryRequestsPercent := 100 * (scheduledRequestedMemory + incomingRequestMemory) / nodeAllocatableMemory
-		bigPodFit := false
-		if ((100*incomingRequestPercent)/gravity.pluginConfig.TargetUtilization > 80) && predictedCPUUsage < 100 {
-			bigPodFit = true
-			klog.V(6).InfoS("Running bigpod logic for", "nodeName", nodeName, "podName%", incomingPodName)
-		}
-		if int64(podCount) > gravity.pluginConfig.MaximumPodsPerNode {
-			klog.V(6).InfoS("Node will NOT be prioritized because pod count is high", "nodeName", nodeName, "podCount", podCount)
-		} else if newCPURequestsPercent > 94 {
-			klog.V(6).InfoS("Node will NOT be prioritized because combined CPU requests would be too high", "nodeName", nodeName, "newCPURequests%", newCPURequestsPercent)
-		} else if newMemoryRequestsPercent > 94 {
-			klog.V(6).InfoS("Node will NOT be prioritized because combined M]memory requests would be too high", "nodeName", nodeName, "newMemoryRequests%", newMemoryRequestsPercent)
-		} else if predictedMemoryUsage > gravity.pluginConfig.MaximumMemoryUtilization {
-			klog.V(6).InfoS("Node will NOT be prioritized because predicted memory utilization would be too high", "nodeName", nodeName, "predictedMemory%", predictedMemoryUsage)
-		} else if !bigPodFit && predictedCPUUsage > gravity.pluginConfig.TargetUtilization {
-			klog.V(6).InfoS("Node will NOT be prioritized because predicted CPU utilization would be too high", "nodeName", nodeName, "predictedCPU%", predictedCPUUsage)
-		} else {
-			klog.V(6).InfoS("Node WILL be prioritized because scheduled resources and measured CPU utilization are within targets",
-				"nodeName", nodeName,
-				"predictedCPU%", predictedCPUUsage,
-				"predictedMemory%", predictedMemoryUsage,
-				"newCPURequests%", newCPURequestsPercent,
-				"newMemoryRequests%", newMemoryRequestsPercent,
-			)
-			fits = true
-		}
+
+	// At this point, we've verified that the incoming Pod could fit on a completely fresh node.
+	// Now we should determine whether the Pod might be a good fit for this node.
+
+	// First check on normal, resource request based fit. If this doesn't fit, nothing we do
+	// would convince the kubelet to take the workload. In practice, this pod should have never
+	// reached our scheduler for this node.
+	if predictedNodeInfo.NonZeroRequested.MilliCPU > nodeInfo.Allocatable.MilliCPU || predictedNodeInfo.NonZeroRequested.Memory > nodeInfo.Allocatable.Memory {
+		klog.V(6).InfoS("Node will NOT be prioritized because existing node requests plus incoming pod requests sum to greater than allocatable",
+			"nodeName", nodeName,
+			"podName", incomingPodName,
+			"predictedRequestedCPU", predictedNodeInfo.NonZeroRequested.MilliCPU,
+			"predictedRequestedMemory", predictedNodeInfo.NonZeroRequested.Memory,
+		)
+		return false, nil
 	}
-	return fits, nil
+
+	// We now know the Pod could technically be scheduled. Now - do we want it there?
+
+	// Not if there are too many pods
+	if int64(podCount) > gravity.pluginConfig.MaximumPodsPerNode {
+		klog.V(6).InfoS("Node will NOT be prioritized because pod count is high",
+			"nodeName", nodeName,
+			"podName", incomingPodName,
+			"podCount", podCount)
+		return false, nil
+	}
+
+	// We could naively check whether expected CPU utilization > targetCPUUtilization, but this will not suffice
+	// for "big pods". We've already deferred huge pods (those which verge on unschedulable). Big pods are those
+	// which might, by themselves, drive utilization greater than the target utilizations.
+	cpuAdder, memoryAdder := gravity.getPodAdder(pod) // find requests in case pod is claiming
+
+	// If we scheduled this pod, what to we think the actual consumed CPU & memory metrics might be
+	predictionForCPUMillisMetric := nodeCPUMillisUseMetric + cpuAdder
+	predictionForMemoryMetric := nodeMemoryUseMetric + memoryAdder
+
+	if percentage(predictionForCPUMillisMetric, allocatableNodeCPUMillis) > targetCPUUtilization {
+		// The pod would indeed drive us over the target utilization
+		if percentage(cpuAdder, predictionForCPUMillisMetric - nodeOverheadInfo.NonZeroRequested.MilliCPU) >= 90 {
+			klog.V(6).InfoS("Node CAN be prioritized because pod CPU request is large relative to node resources an would use most of the node",
+				"nodeName", nodeName,
+				"podName", incomingPodName,
+				"requestedCPU", cpuAdder)
+		} else {
+			// The pod pushes over the target and is not at least 90% of the reason why. Let's wait for another node.
+			klog.V(6).InfoS("Node will NOT be prioritized because new node CPU requests would exceed target",
+				"nodeName", nodeName,
+				"podName", incomingPodName,
+				"requestedCPU", cpuAdder)
+			return false, nil
+		}
+	} else if predictedNodeInfo.NonZeroRequested.MilliCPU > TapOutCPUPercent {
+		// This node has most of its CPU spoken for. Let's leave some headroom.
+		klog.V(6).InfoS("Node will NOT be prioritized because node CPU requests would approach 100%",
+			"nodeName", nodeName,
+			"podName", incomingPodName,
+			"requestedCPU", cpuAdder)
+		return false, nil
+	}
+
+	if percentage(predictionForMemoryMetric, allocatableNodeMemory) > maximumMemoryUtilization {
+		// The pod would indeed drive us over the target memory utilization
+		if percentage(memoryAdder, predictionForMemoryMetric - nodeOverheadInfo.NonZeroRequested.Memory) >= 90 {
+			klog.V(6).InfoS("Node CAN be prioritized because pod is memory request is large relative to node resources and would use most of the node",
+				"nodeName", nodeName,
+				"podName", incomingPodName,
+				"requestedMemory", memoryAdder)
+		} else {
+			// The pod pushes over the target and is not at least 90% of the reason why. Let's wait for another node.
+			klog.V(6).InfoS("Node will NOT be prioritized because new node memory requests would exceed target",
+				"nodeName", nodeName,
+				"podName", incomingPodName,
+				"requestedMemory", memoryAdder)
+			return false, nil
+		}
+	} else if predictedNodeInfo.NonZeroRequested.Memory > TapOutMemoryPercent {
+		// This node has most of its memory spoken for. Let's leave some headroom.
+		klog.V(6).InfoS("Node will NOT be prioritized because node memory requests would approach 100%",
+			"nodeName", nodeName,
+			"podName", incomingPodName,
+			"requestedMemory", memoryAdder)
+		return false, nil
+	}
+
+	return true, nil
 }
 func (gravity *Gravity) Score(_ context.Context, _ *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
 	// Filter() should have done all the calculations necessary to eliminate nodes
@@ -385,11 +466,11 @@ func (gravity *Gravity) Score(_ context.Context, _ *framework.CycleState, pod *v
 	var score = framework.MaxNodeScore
 	klog.V(6).InfoS("Score for host", "nodeName", nodeName, "score", score)
 
-	// Remove the Adder that Filter() would have added since the framework will call NormalizeScore
-	// next -- which does a final check on fit.
+	// If Score is called, there is more than one node up for consideration.
+	// Remove the Adder that Filter() added since the framework will call NormalizeScore
+	// next -- which does a final check on fit and does the addition for the final selected node.
 	cpuAdder, memoryAdder := gravity.getPodAdder(pod)
 	gravity.freshMetricsMap.AddAdder(nodeName, -1*cpuAdder, -1*memoryAdder)
-
 	return score, framework.NewStatus(framework.Success, "")
 }
 
@@ -539,25 +620,38 @@ func (gravity *Gravity) NormalizeScore(ctx context.Context, _ *framework.CycleSt
 							// if there were more than 1 feasible, node, but that will take upstream changes.
 							cpuAdder, memoryAdder := gravity.getPodAdder(pod)
 							gravity.freshMetricsMap.AddAdder(nodeScore.Name, cpuAdder, memoryAdder)
-							klog.V(6).InfoS("Found first underutilized node; other nodes scores will be eliminated", "targetNode", nodeScore.Name, "score", nodeScore.Score)
+							klog.V(6).InfoS("Found first underutilized node; other nodes scores will be eliminated from consideration", "targetNode", nodeScore.Name, "score", nodeScore.Score)
 							targetNodeFound = true
 						}
+					} else {
+						// An error from doesNodeFit means the scheduler does not feel in should be participating in a decision for this pod.
+						// Clear all scores and defer to another scheduler.
+						klog.Errorf("Error returned from node fit check. No scheduling score will be made by this scheduler.", podName, nodeScore.Name, err)
+						for i := range scores {
+							scores[i].Score = framework.MinNodeScore
+						}
+						return nil
 					}
+				} else {
+					klog.Errorf("Unable to acquire nodeInfo for %v on %v; will not assign: %v", podName, nodeScore.Name, err)
+					scoresMap[nodeScore.Name].Score = framework.MinNodeScore
 				}
 
-				if err != nil {
-					// No tainting here, doesPodFitNode should do so if it makes sense based on the error.
-					klog.Errorf("Final node utilization check failed for pod %v on %v; will not assign: %v", podName, nodeScore.Name, err)
-					scoresMap[nodeScore.Name].Score = framework.MinNodeScore
-				} else if !targetNodeFound {
-					_ = gravity.setNodeTaint(ctx, nodeScore.Name, true)
-					scoresMap[nodeScore.Name].Score = framework.MinNodeScore
-				}
 			} else {
 				klog.V(6).InfoS("Found overutilized node while searching for target", "name", nodeScore.Name, "score", nodeScore.Score)
 			}
 		}
 	}
+
+	if !targetNodeFound {
+		klog.V(6).InfoS("Pod could not fit any existing node, tainting all nodes to bring up fresh node", "podName", podName)
+		// We tried to fit all nodes and failed. To make sure the cluster autoscale brings up a new node,
+		// We have to cordon everything else.
+		for _, nodeScore := range scores {
+			_ = gravity.setNodeTaint(ctx, nodeScore.Name, true)
+		}
+	}
+
 	for _, nodeScore := range scores {
 		klog.V(6).InfoS("Scored node", "name", nodeScore.Name, "score", nodeScore.Score)
 	}

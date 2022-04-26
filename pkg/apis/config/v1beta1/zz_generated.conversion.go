@@ -164,16 +164,10 @@ func Convert_config_CoschedulingArgs_To_v1beta1_CoschedulingArgs(in *config.Cosc
 }
 
 func autoConvert_v1beta1_GravityArgs_To_config_GravityArgs(in *GravityArgs, out *config.GravityArgs, s conversion.Scope) error {
-	if err := v1.Convert_Pointer_string_To_string(&in.InstanceName, &out.InstanceName, s); err != nil {
-		return err
-	}
 	if err := v1.Convert_Pointer_int64_To_int64(&in.TargetUtilization, &out.TargetUtilization, s); err != nil {
 		return err
 	}
 	if err := v1.Convert_Pointer_int64_To_int64(&in.AdderTTL, &out.AdderTTL, s); err != nil {
-		return err
-	}
-	if err := v1.Convert_Pointer_float64_To_float64(&in.CPURequestMultiplier, &out.CPURequestMultiplier, s); err != nil {
 		return err
 	}
 	if err := v1.Convert_Pointer_int64_To_int64(&in.MaximumMemoryUtilization, &out.MaximumMemoryUtilization, s); err != nil {
@@ -197,16 +191,10 @@ func Convert_v1beta1_GravityArgs_To_config_GravityArgs(in *GravityArgs, out *con
 }
 
 func autoConvert_config_GravityArgs_To_v1beta1_GravityArgs(in *config.GravityArgs, out *GravityArgs, s conversion.Scope) error {
-	if err := v1.Convert_string_To_Pointer_string(&in.InstanceName, &out.InstanceName, s); err != nil {
-		return err
-	}
 	if err := v1.Convert_int64_To_Pointer_int64(&in.TargetUtilization, &out.TargetUtilization, s); err != nil {
 		return err
 	}
 	if err := v1.Convert_int64_To_Pointer_int64(&in.AdderTTL, &out.AdderTTL, s); err != nil {
-		return err
-	}
-	if err := v1.Convert_float64_To_Pointer_float64(&in.CPURequestMultiplier, &out.CPURequestMultiplier, s); err != nil {
 		return err
 	}
 	if err := v1.Convert_int64_To_Pointer_int64(&in.MaximumMemoryUtilization, &out.MaximumMemoryUtilization, s); err != nil {

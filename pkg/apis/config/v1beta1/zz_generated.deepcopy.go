@@ -105,11 +105,6 @@ func (in *CoschedulingArgs) DeepCopyObject() runtime.Object {
 func (in *GravityArgs) DeepCopyInto(out *GravityArgs) {
 	*out = *in
 	out.TypeMeta = in.TypeMeta
-	if in.InstanceName != nil {
-		in, out := &in.InstanceName, &out.InstanceName
-		*out = new(string)
-		**out = **in
-	}
 	if in.TargetUtilization != nil {
 		in, out := &in.TargetUtilization, &out.TargetUtilization
 		*out = new(int64)
@@ -118,11 +113,6 @@ func (in *GravityArgs) DeepCopyInto(out *GravityArgs) {
 	if in.AdderTTL != nil {
 		in, out := &in.AdderTTL, &out.AdderTTL
 		*out = new(int64)
-		**out = **in
-	}
-	if in.CPURequestMultiplier != nil {
-		in, out := &in.CPURequestMultiplier, &out.CPURequestMultiplier
-		*out = new(float64)
 		**out = **in
 	}
 	if in.MaximumMemoryUtilization != nil {

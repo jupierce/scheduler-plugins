@@ -1,0 +1,145 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gravity
+  namespace: kube-system
+---
+# The scheduler needs to be able to cordon and uncordon nodes based on CPU utilization
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gravity-scheduler-node-tainting
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - watch
+      - list
+      - get
+      - update
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gravity-as-gravity-scheduler-node-tainting
+subjects:
+  - kind: ServiceAccount
+    name: gravity
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: gravity-scheduler-node-tainting
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gravity-as-kube-scheduler
+subjects:
+  - kind: ServiceAccount
+    name: gravity
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: system:kube-scheduler
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gravity-as-cluster-reader
+subjects:
+  - kind: ServiceAccount
+    name: gravity
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  # TODO reduce this to just node metrics
+  name: cluster-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gravity-as-volume-scheduler
+subjects:
+  - kind: ServiceAccount
+    name: gravity
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: system:volume-scheduler
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gravity-extension-apiserver
+  namespace: kube-system
+subjects:
+  - kind: ServiceAccount
+    name: gravity
+    namespace: kube-system
+roleRef:
+  kind: Role
+  name: extension-apiserver-authentication-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    component: scheduler
+    tier: control-plane
+  name: gravity
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      component: scheduler
+      tier: control-plane
+  strategy:
+    # No rolling update.
+    # Owns a port, so cannot launch while another pod is running.
+    type: Recreate
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        component: scheduler
+        tier: control-plane
+        version: second
+    spec:
+      serviceAccountName: gravity
+      hostNetwork: true
+      containers:
+        - name: gravity
+          command:
+            - /bin/kube-scheduler
+            - --address=0.0.0.0
+            - --leader-elect=false
+            - --config=/etc/kubernetes/scheduler-config.yaml
+            - -v=6
+          image: quay.io/openshift-cr/gravity:latest
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: '1'
+          securityContext:
+            privileged: false
+          volumeMounts:
+            - mountPath: /shared
+              name: shared
+            - name: etckubernetes
+              mountPath: /etc/kubernetes
+      volumes:
+        - name: shared
+          hostPath:
+            path: /tmp
+            type: Directory
+        - name: etckubernetes
+          configMap:
+            name: gravity-scheduler-config

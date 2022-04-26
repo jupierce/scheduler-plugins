@@ -1,0 +1,29 @@
+apiVersion: kubescheduler.config.k8s.io/v1beta2
+kind: KubeSchedulerConfiguration
+leaderElection:
+  leaderElect: false
+profiles:
+- schedulerName: gravity-builds
+  plugins:
+    filter:
+      enabled:
+      - name: Gravity
+        weight: 1
+    score:
+      disabled:
+      - name: NodeResourcesBalancedAllocation
+      - name: NodeResourcesLeastAllocated
+      enabled:
+      - name: Gravity
+        weight: 1
+  pluginConfig:
+    - name: Gravity
+      args:
+        instanceName: builds
+        targetUtilization: 40
+        # Builds do not accurately represent their resource requirements
+        # at present. When 40% of CPU is requested, builds can consume over
+        # 100%. Scale these requests until the pod autoscaler can adjust.
+        defaultRequestsMultiplier: "3"
+        defaultRequests:
+          cpu: "10m"
